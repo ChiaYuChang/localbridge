@@ -26,6 +26,7 @@
 - **Commit & Publication Separation**: Commit auth = local seal only. Remote push requires separate explicit user auth.
 - **Fail-Closed Intent Recovery**: On `AUTHORIZATION_DENIED`, return to Step 2 await renewed intent. No autonomous re-draft.
 - **Conventional Commits**: `feat`, `fix`, `refactor`, `test`, `docs`, `chore`. Concise header, no plan slug.
+- **Seal Cadence**: Seal per completed feature right after its gate; fix forward via new changes (jj makes post-seal fixes cheap). One feature per working copy keeps seals atomic without interactive split.
 - **No Background Auto-Update**: User-initiated only. No polling/downloading/mutation without explicit invocation.
 - **Coherent Plan Units & Anti-Rubber-Stamp**: One plan one root intent; decompose by coupling/scope/concerns/verification heterogeneity; JIT sub-plans from blueprints; Reviewer executes counterfactual split challenge.
 - **Finding Severity**: Exactly `Blocker`, `Major`, `Minor`, `Other`. Blocker blocks `REVIEW_PASS`; Major needs fix or Planner waiver; Minor/Other advisory.
@@ -62,8 +63,8 @@
 
 ## Active State & In-Flight Context
 
-- **Observed-At**: `2026-09-15T06:18:16Z @ 8cf7d4f4 (change qqytzxun; sealed parent ovqxszrr 53ac7441)`
-- **Dirty Status**: `dirty (S0 secrets + AGENTS.md memory incl. Module Map; SCAN_CLEAN fixtures-only; barrier pending)`
-- **Milestone**: `COMMIT_FLOW_STEP_6 - caveats collected, memory updated, barrier next`
-- **Next Pickup Item**: `Present commit message for seal auth`
+- **Observed-At**: `2026-09-15T06:22:29Z @ 0186bf7d (change tynnmvvq; sealed parent qqytzxun 72105dfe)`
+- **Dirty Status**: `dirty (S0 code + S1a code unsealed: secrets + directory/allowed/file additions; sealed change clean)`
+- **Milestone**: `BLUEPRINT_WIP - BLUEPRINT_PASS; S0 + S1a + S1b SUBPLAN_REVIEW_PASS (55 pkg tests); S2 git JIT next`
+- **Next Pickup Item**: `S1b sub-plan pair (multi/search + read_file deny/mask retrofit); then S2 git, S3 jj`
 - **Ground Truth Revalidation Invariant**: Cold-start Planners MUST run fresh VCS status/log inspection; never trust cached Active State.

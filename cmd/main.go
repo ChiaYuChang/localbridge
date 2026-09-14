@@ -14,6 +14,8 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
 	tunnelclient "github.com/openai/tunnel-client"
+
+	"github.com/ChiaYuChang/local-mcp/internal/tools/filesystem"
 )
 
 const readyFileEnv = "TUNNEL_CLIENT_SDK_READY_FILE"
@@ -40,6 +42,23 @@ func run(ctx context.Context) error {
 			Content: []mcp.Content{&mcp.TextContent{Text: message}},
 		}, map[string]string{"message": message}, nil
 	})
+
+	workspaceRoot := os.Getenv("WORKSPACE_ROOT")
+	if workspaceRoot == "" {
+		workspaceRoot = "."
+	}
+	fs, err := filesystem.New(workspaceRoot)
+	if err != nil {
+		return err
+	}
+	defer fs.Close()
+	h, err := filesystem.LoadHider(fs)
+	if err != nil {
+		return err
+	}
+	if err := filesystem.RegisterAllTools(server, fs, h); err != nil {
+		return err
+	}
 
 	serverTransport, clientTransport := mcp.NewInMemoryTransports()
 	serverCtx, stopServer := context.WithCancel(ctx)

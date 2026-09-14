@@ -9,8 +9,18 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/ChiaYuChang/local-mcp/internal/tools/secrets"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
+
+func testHider(t *testing.T) *secrets.Hider {
+	t.Helper()
+	h, err := secrets.NewHider()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return h
+}
 
 type boomReader struct {
 	text  string
@@ -35,7 +45,7 @@ func TestToolReadFile_HandleRoundTrip(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer fs.Close()
-	tool := ToolReadFile{fs: fs}
+	tool := ToolReadFile{fs: fs, h: testHider(t)}
 
 	out, res, err := tool.handle(context.Background(), nil, ToolReadFileI{Path: "ok.txt"})
 	if err != nil {
@@ -66,7 +76,7 @@ func TestToolReadFile_HandlePreservedErrors(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer fs.Close()
-	tool := ToolReadFile{fs: fs}
+	tool := ToolReadFile{fs: fs, h: testHider(t)}
 
 	if _, _, err := tool.handle(context.Background(), nil, ToolReadFileI{Path: "missing.txt"}); err == nil {
 		t.Fatalf("want missing-file error")
@@ -135,7 +145,7 @@ func TestToolReadFile_HandleOversizeStat(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer fs.Close()
-	tool := ToolReadFile{fs: fs}
+	tool := ToolReadFile{fs: fs, h: testHider(t)}
 
 	_, res, err := tool.handle(context.Background(), nil, ToolReadFileI{Path: "big.txt"})
 	if err == nil {
@@ -199,7 +209,7 @@ func TestToolReadFile_CheckBareSentinels(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer fs.Close()
-	tool := ToolReadFile{fs: fs}
+	tool := ToolReadFile{fs: fs, h: testHider(t)}
 
 	if _, err := tool.check("missing.txt"); !errors.Is(err, ErrFileOpen) {
 		t.Fatalf("want ErrFileOpen, got %v", err)
@@ -229,7 +239,7 @@ func TestToolReadFile_HandleVerdictOnlyOnTooLarge(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer fs.Close()
-	tool := ToolReadFile{fs: fs}
+	tool := ToolReadFile{fs: fs, h: testHider(t)}
 
 	_, _, err = tool.handle(context.Background(), nil, ToolReadFileI{Path: "bad.txt"})
 	if err == nil || strings.Contains(err.Error(), "likely not a text file") {
@@ -252,7 +262,7 @@ func TestToolReadFile_HandleExactCap(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer fs.Close()
-	tool := ToolReadFile{fs: fs}
+	tool := ToolReadFile{fs: fs, h: testHider(t)}
 
 	_, res, err := tool.handle(context.Background(), nil, ToolReadFileI{Path: "exact.txt"})
 	if err != nil {
@@ -275,7 +285,7 @@ func TestToolReadFile_MCPTransportSuccess(t *testing.T) {
 	defer fs.Close()
 
 	srv := mcp.NewServer(&mcp.Implementation{Name: "test", Version: "0.0.1"}, nil)
-	tool := ToolReadFile{fs: fs}
+	tool := ToolReadFile{fs: fs, h: testHider(t)}
 	if err := tool.Register(srv); err != nil {
 		t.Fatal(err)
 	}
@@ -360,5 +370,195 @@ func TestFormatReadError(t *testing.T) {
 	}
 	if strings.Contains(wrapped.Error(), "likely not a text file") {
 		t.Fatalf("verdict suffix must appear only on over-limit, got %q", wrapped.Error())
+	}
+}
+
+func TestToolReadFile_HandleMasked(t *testing.T) {
+	dir := t.TempDir()
+	secret := "token sk-abcdefghijklmnop1234 here\n"
+	if err := os.WriteFile(filepath.Join(dir, "s.txt"), []byte(secret), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	fs, err := New(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer fs.Close()
+	tool := ToolReadFile{fs: fs, h: testHider(t)}
+
+	_, res, err := tool.handle(context.Background(), nil, ToolReadFileI{Path: "s.txt"})
+	if err != nil {
+		t.Fatalf("handle err: %v", err)
+	}
+	want := "token [REDACTED:API_KEY] here\n"
+	if res.Content != want || res.Size != int64(len(want)) {
+		t.Fatalf("got %+v", res)
+	}
+	if strings.Contains(res.Content, "sk-abcdefghijklmnop1234") {
+		t.Fatalf("secret leaked: %q", res.Content)
+	}
+}
+
+func TestToolReadFile_HandleDenyOracle(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.Mkdir(filepath.Join(dir, ".secrets"), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, ".secrets/s.txt"), []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	fs, err := New(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer fs.Close()
+	tool := ToolReadFile{fs: fs, h: testHider(t)}
+
+	_, _, missingErr := tool.handle(context.Background(), nil, ToolReadFileI{Path: "nope.txt"})
+	_, _, deniedErr := tool.handle(context.Background(), nil, ToolReadFileI{Path: ".secrets/s.txt"})
+	if missingErr == nil || deniedErr == nil || !errors.Is(missingErr, ErrFileOpen) || !errors.Is(deniedErr, ErrFileOpen) {
+		t.Fatalf("missing=%v denied=%v", missingErr, deniedErr)
+	}
+	strip := func(msg, p string) string { return strings.Replace(msg, `"`+p+`"`, `""`, 1) }
+	if strip(missingErr.Error(), "nope.txt") != strip(deniedErr.Error(), ".secrets/s.txt") {
+		t.Fatalf("oracle leak: %q vs %q", missingErr, deniedErr)
+	}
+}
+
+func TestToolReadFile_HandleNilHider(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "ok.txt"), []byte("hi\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	fs, err := New(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer fs.Close()
+	tool := ToolReadFile{fs: fs}
+
+	_, _, err = tool.handle(context.Background(), nil, ToolReadFileI{Path: "ok.txt"})
+	if err == nil || !errors.Is(err, ErrHiderMissing) {
+		t.Fatalf("want ErrHiderMissing, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "read_file") {
+		t.Fatalf("want tool-name guidance, got %q", err.Error())
+	}
+	if strings.Contains(err.Error(), "likely not a text file") {
+		t.Fatalf("no verdict suffix allowed, got %q", err.Error())
+	}
+}
+
+func TestToolReadMultipleFiles_MixedBatch(t *testing.T) {
+	dir := t.TempDir()
+	write := func(name, data string) {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(data), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write("good.txt", "hello sk-abcdefghijklmnop1234\n")
+	write("plain.txt", "plain\n")
+	if err := os.WriteFile(filepath.Join(dir, "bad.txt"), append([]byte("ok\n"), 0xff, 0xfe, '\n'), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(filepath.Join(dir, ".secrets"), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	write(".secrets/s.txt", "x")
+	fs, err := New(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer fs.Close()
+	h := testHider(t)
+	tool := ToolReadMultipleFiles{fs: fs, h: h}
+	single := ToolReadFile{fs: fs, h: h}
+
+	in := ToolReadMultipleFilesI{Paths: []string{"good.txt", "plain.txt", "bad.txt", ".secrets/s.txt", "missing.txt", "sub"}}
+	if err := os.Mkdir(filepath.Join(dir, "sub"), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	out, res, err := tool.handle(context.Background(), nil, in)
+	if err != nil {
+		t.Fatalf("batch must not fail: %v", err)
+	}
+	if len(res.Files) != len(in.Paths) {
+		t.Fatalf("order/len: %+v", res)
+	}
+	for i, f := range res.Files {
+		if f.Path != in.Paths[i] {
+			t.Fatalf("order broken at %d: %+v", i, f)
+		}
+	}
+	if res.Files[0].Content != "hello [REDACTED:API_KEY]\n" || res.Files[0].Size != int64(len("hello [REDACTED:API_KEY]\n")) {
+		t.Fatalf("masked: %+v", res.Files[0])
+	}
+	if res.Files[1].Content != "plain\n" {
+		t.Fatalf("plain: %+v", res.Files[1])
+	}
+	for _, i := range []int{2, 3, 4, 5} {
+		if res.Files[i].Error == "" || res.Files[i].Content != "" {
+			t.Fatalf("entry %d must carry error string only: %+v", i, res.Files[i])
+		}
+	}
+	_, _, serr := single.handle(context.Background(), nil, ToolReadFileI{Path: "bad.txt"})
+	if res.Files[2].Error != serr.Error() {
+		t.Fatalf("per-file text must equal single-read text: %q vs %q", res.Files[2].Error, serr)
+	}
+	if out == nil || len(out.Content) == 0 {
+		t.Fatalf("missing CallToolResult")
+	}
+}
+
+func TestToolReadMultipleFiles_Boundaries(t *testing.T) {
+	dir := t.TempDir()
+	fs, err := New(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer fs.Close()
+	tool := ToolReadMultipleFiles{fs: fs, h: testHider(t)}
+
+	if _, _, err := tool.handle(context.Background(), nil, ToolReadMultipleFilesI{Paths: []string{}}); err == nil {
+		t.Fatalf("want empty-batch error")
+	}
+	if _, _, err := tool.handle(context.Background(), nil, ToolReadMultipleFilesI{Paths: []string{"a.txt"}}); err != nil {
+		t.Fatalf("single-entry batch must attempt per-file, got %v", err)
+	}
+	many := make([]string, MaxBatchFiles+1)
+	for i := range many {
+		many[i] = "missing.txt"
+	}
+	if _, _, err := tool.handle(context.Background(), nil, ToolReadMultipleFilesI{Paths: many}); err == nil || !strings.Contains(err.Error(), "50") {
+		t.Fatalf("want 51-batch error, got %v", err)
+	}
+	fifty := make([]string, MaxBatchFiles)
+	for i := range fifty {
+		fifty[i] = "missing.txt"
+	}
+	out, res, err := tool.handle(context.Background(), nil, ToolReadMultipleFilesI{Paths: fifty})
+	if err != nil || len(res.Files) != MaxBatchFiles {
+		t.Fatalf("50-batch: %+v %v", res, err)
+	}
+	if out == nil {
+		t.Fatalf("missing result")
+	}
+}
+
+func TestToolReadMultipleFiles_NilHider(t *testing.T) {
+	dir := t.TempDir()
+	fs, err := New(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer fs.Close()
+	tool := ToolReadMultipleFiles{fs: fs}
+
+	_, _, err = tool.handle(context.Background(), nil, ToolReadMultipleFilesI{Paths: []string{"a.txt"}})
+	if err == nil || !errors.Is(err, ErrHiderMissing) {
+		t.Fatalf("want ErrHiderMissing, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "read_multiple_files") {
+		t.Fatalf("want tool-name guidance, got %q", err.Error())
 	}
 }
