@@ -5,7 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"strings"
+	"os"
+	"slices"
 	"unicode/utf8"
 
 	"github.com/ChiaYuChang/local-mcp/internal/tools"
@@ -16,16 +17,20 @@ const (
 	MaxFileSizeMB = 4
 	MaxFileSize   = MaxFileSizeMB << 20 // 4MB
 
-	MaxPartialFileSizeMB = 1
-	MaxPartialFileSize   = MaxPartialFileSizeMB << 20 // 1 MiB
-
 	MaxBatchFiles = 50
 )
 
 var (
-	ErrFileTooLarge      = errors.New("file too large")
-	ErrReadLimitExceeded = errors.New("read limit exceeded")
+	ErrFileTooLarge = errors.New("file too large")
+	ErrFileOpen     = errors.New("cannot open file")
+	ErrNotAFile     = errors.New("not a file")
+	ErrInvalidUTF8  = errors.New("not valid UTF-8")
+	ErrFileRead     = errors.New("cannot read file")
 )
+
+// ErrTaxonomy is the membership set for the normalize step in formatError;
+// it is never displayed. Unknown errors normalize to ErrFileRead there.
+var ErrTaxonomy = []error{ErrFileOpen, ErrNotAFile, ErrFileTooLarge, ErrInvalidUTF8, ErrFileRead}
 
 type ToolReadFileI struct {
 	Path string `json:"path"`
@@ -47,50 +52,33 @@ func (t ToolReadFile) Name() string {
 	return "read_file"
 }
 
+func (t ToolReadFile) formatError(path string, err error) error {
+	if !slices.ContainsFunc(ErrTaxonomy, func(s error) bool {
+		return errors.Is(err, s)
+	}) {
+		err = ErrFileRead
+	}
+	verdict := ""
+	if errors.Is(err, ErrFileTooLarge) {
+		verdict = fmt.Sprintf("; exceeds the %d MB text-file limit, likely not a text file and will not be read", MaxFileSizeMB)
+	}
+	return fmt.Errorf("%q: %w%s", path, err, verdict)
+}
+
 func (t ToolReadFile) handle(
 	_ context.Context,
 	_ *mcp.CallToolRequest,
 	in ToolReadFileI,
 ) (*mcp.CallToolResult, ToolReadFileO, error) {
-	f, err := t.fs.root.Open(in.Path)
+	f, err := t.check(in.Path)
 	if err != nil {
-		return nil, ToolReadFileO{}, err
+		return nil, ToolReadFileO{}, t.formatError(in.Path, err)
 	}
 	defer f.Close()
 
-	info, err := f.Stat()
+	bs, err := t.read(f)
 	if err != nil {
-		return nil, ToolReadFileO{}, err
-	}
-
-	if info.IsDir() {
-		return nil, ToolReadFileO{},
-			fmt.Errorf("%q is a directory", in.Path)
-	}
-
-	if info.Size() > MaxFileSize {
-		return nil, ToolReadFileO{},
-			fmt.Errorf("%w: maximum size is %d MB",
-				ErrFileTooLarge,
-				MaxFileSizeMB,
-			)
-	}
-
-	bs, err := io.ReadAll(io.LimitReader(f, MaxFileSize+1))
-	if err != nil {
-		return nil, ToolReadFileO{}, err
-	}
-	if len(bs) > MaxFileSize {
-		return nil, ToolReadFileO{},
-			fmt.Errorf("%w: maximum size is %d MB",
-				ErrFileTooLarge,
-				MaxFileSizeMB,
-			)
-	}
-
-	if !utf8.Valid(bs) {
-		return nil, ToolReadFileO{},
-			fmt.Errorf("%q is not valid UTF-8", in.Path)
+		return nil, ToolReadFileO{}, t.formatError(in.Path, err)
 	}
 
 	content := string(bs)
@@ -107,113 +95,51 @@ func (t ToolReadFile) handle(
 		}, nil
 }
 
+func (t ToolReadFile) check(path string) (*os.File, error) {
+	f, err := t.fs.root.Open(path)
+	if err != nil {
+		return nil, ErrFileOpen
+	}
+
+	info, err := f.Stat()
+	if err != nil {
+		f.Close()
+		return nil, ErrFileOpen
+	}
+
+	if info.IsDir() {
+		f.Close()
+		return nil, ErrNotAFile
+	}
+
+	if info.Size() > MaxFileSize {
+		f.Close()
+		return nil, ErrFileTooLarge
+	}
+
+	return f, nil
+}
+
+func (t ToolReadFile) read(r io.Reader) ([]byte, error) {
+	bs, err := io.ReadAll(io.LimitReader(r, MaxFileSize+1))
+	if err != nil {
+		return nil, ErrFileRead
+	}
+	if len(bs) > MaxFileSize {
+		return nil, ErrFileTooLarge
+	}
+	if !utf8.Valid(bs) {
+		return nil, ErrInvalidUTF8
+	}
+	return bs, nil
+}
+
 func (t ToolReadFile) Register(srv *mcp.Server) error {
 	mcp.AddTool(
 		srv,
 		&mcp.Tool{
 			Name:        t.Name(),
-			Description: "Read a UTF-8 text file from the current workspace.",
-		},
-		t.handle,
-	)
-	return nil
-}
-
-type ToolReadPartialFileI struct {
-	Path      string `json:"path"`
-	StartLine int    `json:"start_line"`
-	EndLine   int    `json:"end_line"`
-}
-
-type ToolReadPartialFileO struct {
-	Path      string `json:"path"`
-	StartLine int    `json:"start_line"`
-	EndLine   int    `json:"end_line"`
-	Content   string `json:"content"`
-	Size      int64  `json:"size"`
-}
-
-type ToolReadPartialFile struct {
-	fs *FileSystem
-}
-
-var _ tools.Tool = ToolReadPartialFile{}
-
-func (t ToolReadPartialFile) Name() string {
-	return "read_partial_file"
-}
-
-func (t ToolReadPartialFile) handle(
-	_ context.Context,
-	_ *mcp.CallToolRequest,
-	in ToolReadPartialFileI,
-) (*mcp.CallToolResult, ToolReadPartialFileO, error) {
-	if in.StartLine < 1 {
-		return nil, ToolReadPartialFileO{},
-			errors.New("start_line must be greater than zero")
-	}
-
-	if in.EndLine < in.StartLine {
-		return nil, ToolReadPartialFileO{},
-			errors.New("end_line must be greater than or equal to start_line")
-	}
-
-	f, err := t.fs.root.Open(in.Path)
-	if err != nil {
-		return nil, ToolReadPartialFileO{}, err
-	}
-	defer f.Close()
-
-	info, err := f.Stat()
-	if err != nil {
-		return nil, ToolReadPartialFileO{}, err
-	}
-
-	if info.IsDir() {
-		return nil, ToolReadPartialFileO{},
-			fmt.Errorf("%q is a directory", in.Path)
-	}
-
-	reader := NewLimitedReader(f, LimitedReaderOptions{
-		Separator:     DefaultSeparator,
-		MaxLineBytes:  DefaultMaxLineBytes,
-		MaxTotalBytes: MaxPartialFileSize,
-	})
-	res, err := reader.ReadLines(in.StartLine, in.EndLine)
-	if err != nil {
-		if strings.Contains(err.Error(), "not valid UTF-8") {
-			return nil, ToolReadPartialFileO{},
-				fmt.Errorf("%q is not valid UTF-8", in.Path)
-		}
-		return nil, ToolReadPartialFileO{}, err
-	}
-
-	out := ToolReadPartialFileO{
-		Path:      in.Path,
-		StartLine: in.StartLine,
-		EndLine:   res.EffectiveEnd,
-		Content:   res.Content,
-		Size:      int64(len(res.Content)),
-	}
-	result := &mcp.CallToolResult{
-		Content: []mcp.Content{
-			&mcp.TextContent{
-				Text: res.Content,
-			},
-		},
-	}
-	if res.StopReason == StopReadLimitExceeded || res.StopReason == StopLineTooLong {
-		return result, out, errors.New(strings.Join(res.Details, "; "))
-	}
-	return result, out, nil
-}
-
-func (t ToolReadPartialFile) Register(srv *mcp.Server) error {
-	mcp.AddTool(
-		srv,
-		&mcp.Tool{
-			Name:        t.Name(),
-			Description: "Read a UTF-8 text file from the current workspace. Prefer small line ranges; if the range hits a limit, retry with a narrower range or fewer lines.",
+			Description: "Read a UTF-8 text file from the current workspace. Files exceeding the 4 MB text-file limit are rejected as likely non-text and will not be read.",
 		},
 		t.handle,
 	)

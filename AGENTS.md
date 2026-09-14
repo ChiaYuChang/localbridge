@@ -3,7 +3,7 @@
 ## Architectural Topology & Jurisdictions
 
 - **Repository Tier**: Product MCP server (`github.com/ChiaYuChang/local-mcp`, Go 1.27.0, devenv). Orchestration: AgentPlaybook roles `planner`, `reviewer`, `builder`, `scout`, `verifier` (`core`), `navigator`, `cartographer` (`companion`). Flows: `init`, `plan`, `blueprint`, `build`, `review`, `commit`, `cartography`, `session-handoff`, `e2e`, `navigator-cartography`. Memory: living `AGENTS.md`.
-- **External Interfaces**: MCP over OpenAI Tunnel (`tunnelclient.New`, `client.Start`, `WaitUntilReady`); in-memory transports (`mcp.NewInMemoryTransports`, `server.Run`); tools `echo`, `read_file`, `read_partial_file`; env `CONTROL_PLANE_TUNNEL_ID`, `CONTROL_PLANE_API_KEY`/`OPENAI_API_KEY`, `CONTROL_PLANE_BASE_URL`, `CONTROL_PLANE_ORGANIZATION_ID`, `CONTROL_PLANE_POLL_TIMEOUT`, `CONTROL_PLANE_EXTRA_HEADERS`, `TUNNEL_CLIENT_SDK_READY_FILE`.
+- **External Interfaces**: MCP over OpenAI Tunnel (`tunnelclient.New`, `client.Start`, `WaitUntilReady`); in-memory transports (`mcp.NewInMemoryTransports`, `server.Run`); tools `echo`, `read_file`; env `CONTROL_PLANE_TUNNEL_ID`, `CONTROL_PLANE_API_KEY`/`OPENAI_API_KEY`, `CONTROL_PLANE_BASE_URL`, `CONTROL_PLANE_ORGANIZATION_ID`, `CONTROL_PLANE_POLL_TIMEOUT`, `CONTROL_PLANE_EXTRA_HEADERS`, `TUNNEL_CLIENT_SDK_READY_FILE`.
 - **Module Map**: Entry `main.go` (root, broken import `internal/tools/echo`) vs canonical `cmd/main.go` (inline echo); contract `internal/tools/tools.go` (`Tool{Name,Register}`); impl `internal/tools/test/echo.go` (`ToolEcho`); sandbox `internal/tools/filesystem/filesystem.go` (`os.OpenRoot`, `FileSystem{root *os.Root}`); readers `internal/tools/filesystem/file.go`; stubs `directory.go`, `path.go`, `search.go` (0 bytes); tests `cmd/main_test.go`; empty `tests/`.
 - **Artifact Governance**: Vault `~/.agentplaybook/<project>/plan`, `~/.agentplaybook/<project>/e2e`; docs `blueprint-plan`, `sub-build-plan`, `sub-review-plan`, `sub-review-resolution`, `review-resolution`, `diagram-brief`, `diagram-completion`, `diagram-clarification-request`, `e2e-brief`, `e2e-report`, `e2e-test-spec`, `e2e-clarification-request`.
 - **Blind Barrier, Scout Isolation & Companion Allowlist**: `review-findings` restricted to `["planner","reviewer"]`; Builder receives Planner-sanitized remediation only. Scout excluded from in-flight plans/findings. Navigator/Cartographer visibility limited to Settled-Artifact Allowlist (`agents-md`, `review-resolution`, `sub-review-resolution`) plus authorized diagram messages; in-flight drafts exclude companions. Navigator acts only in `navigator-cartography`; Cartographer owns only `diagram-completion`, `diagram-clarification-request`, acts only in `cartography`, `navigator-cartography`.
@@ -36,9 +36,12 @@
 
 - **Dual Entry Divergence**: Root `main.go:14` imports nonexistent `internal/tools/echo` (actual `internal/tools/test`, package `test`). Canonical runnable `cmd/main.go` uses inline echo. Verify via `go vet ./...`, `go build ./...` before assuming root builds. Do not fix by guessing canonical entry; await Planner plan.
 - **`os.Root` Confinement**: `FileSystem.New(root)` via `os.OpenRoot`; all opens through `fs.root.Open`; `Close` required; rejects escape; no symlink/mount bypass; no absolute host paths outside root.
-- **Read Limits**: `read_file` max 4MB (`MaxFileSize`), `read_partial_file` max 1MB (`MaxPartialFileSize`), `MaxBatchFiles=50`; UTF-8 enforced (`utf8.Valid`); dir rejected; `start_line>=1`, `end_line>=start_line`, `start_line` beyond EOF errors.
+- **Package Read Policy**: Every file-content read in `internal/tools/filesystem` uses stdlib `io` only (`io.LimitReader` + `utf8.Valid`); stat size early-gate + TOCTOU recheck, over-limit/UTF-8 hard errors with zero content. Retired 2026-09-14: in-house `LimitedReader`, `read_partial_file`, partial returns (line numbers unknowable upfront; over-limit files treated as non-text).
+- **Tool Shape Convention**: Per-tool methods split `check` (open/stat/gate) then `do` (`read`/actions); `handle()` orchestrates only. Shared formatters stay single-call-site.
+- **Error Taxonomy & Echo-Input**: Inner code returns bare sentinels (`ErrFileOpen`, `ErrNotAFile`, `ErrFileTooLarge`, `ErrInvalidUTF8`, `ErrFileRead`); only `handle()` formats (`"%q: %w"` via membership-checked `ErrTaxonomy`, unknown normalizes to `ErrFileRead`); messages echo caller-supplied paths verbatim, never absolute paths; zero content on errors.
+- **Read Limits**: `read_file` max 4MB (`MaxFileSize`); stat early-gate (`tooLargeError`: cap + non-text verdict) + streaming recheck via `readCapped`; UTF-8 enforced; dir rejected; single tool, no ranges, no partials.
 - **Empty Stubs**: `filesystem/directory.go`, `path.go`, `search.go` 0 bytes. Do not import unimplemented symbols. Implement or remove only per approved plan.
-- **Tool Contract**: Input/output structs with `json` tags (`ToolEchoI`, `ToolEchoO`, `ToolReadFileI/O`, `ToolReadPartialFileI/O`); `Name()` unique (`echo`, `read_file`, `read_partial_file`); `Register(*mcp.Server) error` via `mcp.AddTool`; handler returns `(CallToolResult, Output, error)`.
+- **Tool Contract**: Input/output structs with `json` tags (`ToolEchoI/O`, `ToolReadFileI/O`); `Name()` unique (`echo`, `read_file`); `Register(*mcp.Server) error` via `mcp.AddTool`; handler returns `(CallToolResult, Output, error)`.
 - **Env Parsing**: `CONTROL_PLANE_TUNNEL_ID` required; `APIKey` falls back `CONTROL_PLANE_API_KEY` -> `OPENAI_API_KEY`; `durationFromEnvironment` uses `time.ParseDuration`, must be >0; `headersFromEnvironment` splits `,`/`;`, each `Key: Value`, trims spaces, rejects malformed; `writeReadyFile` mode `0600`, no-op on empty path.
 - **Tunnel Lifecycle**: `tunnelclient.New(cfg, clientTransport)` -> `Start(ctx)` -> `WaitUntilReady(ctx)` -> serve until `ctx.Done`/`client.Done`/`serverDone`; `Stop` with 5s timeout deferred. No real control-plane in unit tests; keep tests hermetic with `t.Setenv`.
 - **Toolchain**: `devenv.yaml` rolling nixpkgs, `allow_unfree:true`; Go 1.27.0; `.secrets/` gitignored, never copy/mount operator secrets into sandbox; generated creds local-only throwaway.
@@ -51,7 +54,7 @@
 - **Public-Only Guidance**: `AGENTS.md` holds public operational facts only. Exclude private criteria, hidden fixtures, inspection methods.
 - **Contract Falsifiability**: Boundary tests assert observable I/O/errors at `Tool` boundary, must fail on plausible violation; distinct from TDD reproductions.
 - **Plan Coverage**: Audit every Build invariant against independent Review verification path; check Track B fields, baseline identity, severity disposition.
-- **Product Checks**: `os.Root` escape attempts blocked; size/UTF-8/dir guards hit; `start_line`/`end_line` edge cases; dual-entry drift (`main.go` vs `cmd/main.go`) flagged; unregistered filesystem tools (`read_file` not wired in `run()`) flagged as scope gap; empty stubs flagged; `0600` ready-file, no secret leak, `.secrets/` untracked.
+- **Product Checks**: `os.Root` escape attempts blocked; size/UTF-8/dir guards hit; exact-cap vs cap+1 boundaries; dual-entry drift (`main.go` vs `cmd/main.go`) flagged; unregistered filesystem tools (`read_file` not wired in `run()`) flagged as scope gap; empty stubs flagged; `0600` ready-file, no secret leak, `.secrets/` untracked.
 - **Resolution Hygiene**: Shared resolutions sanitized actionable-only; exclude review-plan criteria/fixtures/methods; keep task findings out of `AGENTS.md`.
 - **Scout Confidentiality**: Verify `scout-survey` provenance/evidence/uncertainties; keep Scout read-only, no access to private review artifacts.
 - **Language Purity & Barrier Audit**: Audit `AGENTS.md` for secret leaks, unauthorized non-ASCII without inline rationale, fluff; verify no `review-findings` leak to Builder/companions.
@@ -59,8 +62,8 @@
 
 ## Active State & In-Flight Context
 
-- **Observed-At**: `2026-09-14T14:57:49Z @ a8e75904 (change tvktruox)`
-- **Dirty Status**: `dirty (21 adds unsealed incl opencode.json vault-allow; SCAN_CLEAN; commit flow Step 6 done)`
-- **Milestone**: `COMMIT_FLOW_AUTH_GATE - candidate stabilized, AGENTS.md barrier check pending, seal awaiting explicit auth`
-- **Next Pickup Item**: `Reviewer AGENTS_REVIEW_PASS/BARRIER_LEAK verdict, then present message for seal auth`
+- **Observed-At**: `2026-09-15T04:59:49Z @ 49886d66 (change ovqxszrr; sealed parent tvktruox 4ce753a1)`
+- **Dirty Status**: `dirty (simplify + taxonomy candidate: 2 M + 1 A + 2 D; SCAN pending; barrier pending)`
+- **Milestone**: `COMMIT_FLOW_STEP_6 - caveats collected, memory updated, barrier+scan next`
+- **Next Pickup Item**: `Reviewer barrier verdict, stabilization + secret scan, present message for seal auth`
 - **Ground Truth Revalidation Invariant**: Cold-start Planners MUST run fresh VCS status/log inspection; never trust cached Active State.
