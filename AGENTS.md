@@ -4,7 +4,7 @@
 
 - **Repository Tier**: Product MCP server (`github.com/ChiaYuChang/local-mcp`, Go 1.27.0, devenv). Orchestration: AgentPlaybook roles `planner`, `reviewer`, `builder`, `scout`, `verifier` (`core`), `navigator`, `cartographer` (`companion`). Flows: `init`, `plan`, `blueprint`, `build`, `review`, `commit`, `cartography`, `session-handoff`, `e2e`, `navigator-cartography`. Memory: living `AGENTS.md`.
 - **External Interfaces**: MCP over OpenAI Tunnel (`tunnelclient.New`, `client.Start`, `WaitUntilReady`); in-memory transports (`mcp.NewInMemoryTransports`, `server.Run`); tools `echo`, `read_file`; env `CONTROL_PLANE_TUNNEL_ID`, `CONTROL_PLANE_API_KEY`/`OPENAI_API_KEY`, `CONTROL_PLANE_BASE_URL`, `CONTROL_PLANE_ORGANIZATION_ID`, `CONTROL_PLANE_POLL_TIMEOUT`, `CONTROL_PLANE_EXTRA_HEADERS`, `TUNNEL_CLIENT_SDK_READY_FILE`.
-- **Module Map**: Entry `main.go` (root, broken import `internal/tools/echo`) vs canonical `cmd/main.go` (inline echo); contract `internal/tools/tools.go` (`Tool{Name,Register}`); impl `internal/tools/test/echo.go` (`ToolEcho`); sandbox `internal/tools/filesystem/filesystem.go` (`os.OpenRoot`, `FileSystem{root *os.Root}`); readers `internal/tools/filesystem/file.go`; stubs `directory.go`, `path.go`, `search.go` (0 bytes); tests `cmd/main_test.go`; empty `tests/`.
+- **Module Map**: Entry `main.go` (root, broken import `internal/tools/echo`) vs canonical `cmd/main.go` (inline echo); contract `internal/tools/tools.go` (`Tool{Name,Register}`); impl `internal/tools/test/echo.go` (`ToolEcho`); sandbox `internal/tools/filesystem/filesystem.go` (`os.OpenRoot`, `FileSystem{root *os.Root}`); readers `internal/tools/filesystem/file.go`; secrets `internal/tools/secrets/secrets.go` (`Denied`, layered `NewHider`/`Redact`); stubs `directory.go`, `path.go`, `search.go` (0 bytes); tests `cmd/main_test.go`; empty `tests/`.
 - **Artifact Governance**: Vault `~/.agentplaybook/<project>/plan`, `~/.agentplaybook/<project>/e2e`; docs `blueprint-plan`, `sub-build-plan`, `sub-review-plan`, `sub-review-resolution`, `review-resolution`, `diagram-brief`, `diagram-completion`, `diagram-clarification-request`, `e2e-brief`, `e2e-report`, `e2e-test-spec`, `e2e-clarification-request`.
 - **Blind Barrier, Scout Isolation & Companion Allowlist**: `review-findings` restricted to `["planner","reviewer"]`; Builder receives Planner-sanitized remediation only. Scout excluded from in-flight plans/findings. Navigator/Cartographer visibility limited to Settled-Artifact Allowlist (`agents-md`, `review-resolution`, `sub-review-resolution`) plus authorized diagram messages; in-flight drafts exclude companions. Navigator acts only in `navigator-cartography`; Cartographer owns only `diagram-completion`, `diagram-clarification-request`, acts only in `cartography`, `navigator-cartography`.
 - **Navigator Governance**: Star topology (`user`,`planner`,`cartographer` only); fixed handoff `Please send this requirement directly to Planner` on change intent; queries zero side-effect, zero Planner response obligation; source-restricted responses with `[Source: <path> | Observed: <rev> @ <timestamp>]`; gated to `idle`/`done`, max 1 in-flight, <500 chars, discard on non-eligible, fallback static artifacts.
@@ -62,8 +62,8 @@
 
 ## Active State & In-Flight Context
 
-- **Observed-At**: `2026-09-15T04:59:49Z @ 49886d66 (change ovqxszrr; sealed parent tvktruox 4ce753a1)`
-- **Dirty Status**: `dirty (simplify + taxonomy candidate: 2 M + 1 A + 2 D; SCAN pending; barrier pending)`
-- **Milestone**: `COMMIT_FLOW_STEP_6 - caveats collected, memory updated, barrier+scan next`
-- **Next Pickup Item**: `Reviewer barrier verdict, stabilization + secret scan, present message for seal auth`
+- **Observed-At**: `2026-09-15T06:18:16Z @ 8cf7d4f4 (change qqytzxun; sealed parent ovqxszrr 53ac7441)`
+- **Dirty Status**: `dirty (S0 secrets + AGENTS.md memory incl. Module Map; SCAN_CLEAN fixtures-only; barrier pending)`
+- **Milestone**: `COMMIT_FLOW_STEP_6 - caveats collected, memory updated, barrier next`
+- **Next Pickup Item**: `Present commit message for seal auth`
 - **Ground Truth Revalidation Invariant**: Cold-start Planners MUST run fresh VCS status/log inspection; never trust cached Active State.
