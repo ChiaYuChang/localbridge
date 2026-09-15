@@ -1,0 +1,100 @@
+#!/bin/sh
+# fake-jj: deterministic jj stub for contract tests. Records each
+# invocation's argv (one arg per <%s> line, invocations separated by @@@)
+# to $JJ_FIXTURE_LOG, then dispatches canned outputs per subcommand.
+# Modes via $JJ_FIXTURE_MODE: "" (default canned), notarepo, sleep
+# (timeout kill), overcap, nonutf8. $JJ_FIXTURE_CONFLICTS_EMPTY=1 serves
+# an empty conflicts() answer; $JJ_FIXTURE_STATUS_EMPTY=1 serves status
+# with no "Working copy changes:" section.
+{
+	printf '@@@\n'
+	printf '<%s>\n' "$@"
+} >> "${JJ_FIXTURE_LOG:-/dev/null}"
+
+fail_notarepo() {
+	echo "Error: There is no jj repo in \"$1\"" >&2
+	exit 1
+}
+
+case "${JJ_FIXTURE_MODE:-}" in
+notarepo) fail_notarepo "${JJ_FIXTURE_ROOT:-/none}" ;;
+sleep) exec sleep 30 ;;
+overcap)
+	i=0
+	while [ "$i" -lt 80 ]; do
+		head -c 16384 /dev/zero | tr '\0' 'B'
+		i=$((i + 1))
+	done
+	exit 0
+	;;
+nonutf8)
+	printf 'a\377\376b\n'
+	exit 0
+	;;
+esac
+
+sub=""
+prev=""
+for a in "$@"; do
+	if [ "$prev" = "-R" ]; then
+		prev=""
+		continue
+	fi
+	case "$a" in
+	--no-pager | --color=never | --ignore-working-copy) continue ;;
+	-R) prev="-R" ;;
+	-*) continue ;;
+	*) sub="$a"; break ;;
+	esac
+done
+case "$sub" in
+status)
+	if [ "${JJ_FIXTURE_STATUS_BADCODE:-}" = "1" ]; then
+		printf 'The working copy has no changes.\nWorking copy changes:\nA ok.txt\nX weird.txt\nM late.txt\nWorking copy  (@) : abcdef12 12345678 test subject\nParent commit (@-): zzzzzzzz 00000000 (empty) (no description set)\n'
+	elif [ "${JJ_FIXTURE_STATUS_EMPTY:-}" = "1" ]; then
+		printf 'The working copy has no changes.\nWorking copy  (@) : abcdef12 12345678 test subject\nParent commit (@-): zzzzzzzz 00000000 (empty) (no description set)\n'
+	else
+		printf 'The working copy has no changes.\nWorking copy changes:\nA conclusion.txt\nM draft.txt\nD old.txt\nR {orig.txt => renamed.txt}\nA .secrets/leak.txt\nWorking copy  (@) : abcdef12 12345678 test subject\nParent commit (@-): zzzzzzzz 00000000 (empty) (no description set)\n'
+	fi
+	exit 0
+	;;
+log)
+	for a in "$@"; do
+		case "$a" in
+		*conflicts\(\)*)
+			if [ "${JJ_FIXTURE_CONFLICTS_EMPTY:-}" = "1" ]; then
+				exit 0
+			fi
+			printf 'abc12345\ndef67890\n'
+			exit 0
+			;;
+		esac
+	done
+	case "${JJ_FIXTURE_LOG_MODE:-}" in
+	separator) printf 'a1b2c3d4\037e5f6a7b8\037t\0372026-01-01\037one\037two\n' ;;
+	multiline) printf 'a1b2c3d4\037e5f6a7b8\037bad\nname\0372026-01-01\037s\n' ;;
+	secret) printf 'a1b2c3d4\037e5f6a7b8\037t\0372026-01-01\037token sk-abcdefghijklmnop1234 here\nc3d4e5f6\037a7b8c9d0\037u\0372026-01-02\037plain\n' ;;
+	empty) printf '' ;;
+	*) printf 'a1b2c3d4\037e5f6a7b8\037t\0372026-01-01\037first subject\nc3d4e5f6\037a7b8c9d0\037u\0372026-01-02\037\n' ;;
+	esac
+	exit 0
+	;;
+diff)
+	printf 'diff --git a/f.txt b/f.txt\nnew file mode 100644\nindex 0000000000..abc\n--- /dev/null\n+++ b/f.txt\n@@ -0,0 +1 @@\n+token sk-abcdefghijklmnop1234\n'
+	exit 0
+	;;
+show)
+	for a in "$@"; do
+		case "$a" in
+		nosuchrevxyz)
+			echo "Error: Revision \`nosuchrevxyz' doesn't exist" >&2
+			exit 1
+			;;
+		esac
+	done
+	printf 'Commit ID: abc\nChange ID: xyz\nAuthor   : t\n\n    canned subject\n\ndiff --git a/g.txt b/g.txt\n+line\n'
+	exit 0
+	;;
+esac
+echo "fake-jj: unknown subcommand $sub" >&2
+exit 2

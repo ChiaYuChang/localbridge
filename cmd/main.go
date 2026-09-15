@@ -17,6 +17,7 @@ import (
 
 	"github.com/ChiaYuChang/local-mcp/internal/tools/filesystem"
 	"github.com/ChiaYuChang/local-mcp/internal/tools/git"
+	"github.com/ChiaYuChang/local-mcp/internal/tools/jj"
 )
 
 const readyFileEnv = "TUNNEL_CLIENT_SDK_READY_FILE"
@@ -70,6 +71,18 @@ func run(ctx context.Context) error {
 		return err
 	}
 	if err := git.RegisterGitTools(server, g, h); err != nil {
+		return err
+	}
+
+	jjRoot, err := jj.ResolveRoot(os.Getenv("JJ_ROOT"), workspaceRoot)
+	if err != nil {
+		return err
+	}
+	j, err := jj.NewJJ(jjRoot)
+	if err != nil {
+		return err
+	}
+	if err := jj.RegisterJJTools(server, j, h); err != nil {
 		return err
 	}
 
