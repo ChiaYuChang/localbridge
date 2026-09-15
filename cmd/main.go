@@ -16,6 +16,7 @@ import (
 	tunnelclient "github.com/openai/tunnel-client"
 
 	"github.com/ChiaYuChang/local-mcp/internal/tools/filesystem"
+	"github.com/ChiaYuChang/local-mcp/internal/tools/git"
 )
 
 const readyFileEnv = "TUNNEL_CLIENT_SDK_READY_FILE"
@@ -57,6 +58,18 @@ func run(ctx context.Context) error {
 		return err
 	}
 	if err := filesystem.RegisterAllTools(server, fs, h); err != nil {
+		return err
+	}
+
+	gitRoot, err := git.ResolveRoot(os.Getenv("GIT_ROOT"), workspaceRoot)
+	if err != nil {
+		return err
+	}
+	g, err := git.NewGit(gitRoot)
+	if err != nil {
+		return err
+	}
+	if err := git.RegisterGitTools(server, g, h); err != nil {
 		return err
 	}
 
