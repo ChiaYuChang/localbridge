@@ -69,9 +69,9 @@ func commitAll(t *testing.T, dir, msg string, extra ...string) {
 	gitRun(t, dir, append(args, extra...)...)
 }
 
-func testHider(t *testing.T) *secrets.Hider {
+func testHider(t *testing.T) *secrets.SecretHider {
 	t.Helper()
-	h, err := secrets.NewHider()
+	h, err := secrets.NewSecretHider(nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -412,7 +412,7 @@ func TestGitLog_MaskedSubjects(t *testing.T) {
 func TestGitLog_SeparatorExtra(t *testing.T) {
 	dir := initRepo(t)
 	commitShape(t, dir, "a.txt", "a\n", "one")
-	h, err := secrets.NewHider([]secrets.Pattern{{Regex: "\x1f", Replace: "PIPE"}})
+	h, err := secrets.NewSecretHider(nil, []secrets.Secret{{Pattern: "\x1f", Replace: "PIPE"}})
 	if err != nil {
 		t.Fatal(err)
 	}

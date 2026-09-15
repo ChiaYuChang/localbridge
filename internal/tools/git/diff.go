@@ -28,7 +28,7 @@ type ToolGitDiffO struct {
 
 type ToolGitDiff struct {
 	git *Git
-	h   *secrets.Hider
+	h   *secrets.SecretHider
 }
 
 var _ tools.Tool = ToolGitDiff{}

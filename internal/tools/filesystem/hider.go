@@ -13,25 +13,26 @@ import (
 )
 
 // ErrHiderMissing fails closed any content-tool use without an injected
-// Hider. It joins ErrTaxonomy (file.go) so errors.Is identifies it.
+// SecretHider. It joins ErrTaxonomy (file.go) so errors.Is identifies it.
 var ErrHiderMissing = errors.New("hider missing")
 
 const (
 	// REDACT_EXTRA_PATTERNS carries the server tier as a JSON array of
-	// {Regex, Replace} shaped by secrets.Pattern. Absent means no tier.
+	// secrets.Secret rows (external `regex` key; existing `Regex`-key
+	// corpus keeps working). Absent means no tier.
 	serverTierEnv = "REDACT_EXTRA_PATTERNS"
 	// projectTierFile is the root-local project tier, parsed by shape only
 	// here; its name/format is fixed by this package for S1 consumers.
 	projectTierFile = ".mcp-redact.json"
 )
 
-// LoadHider builds the single shared Hider for a server startup: server
+// LoadHider builds the single shared SecretHider for a server startup: server
 // env tier (layer 0) plus root project tier file (layer 1) over frozen
 // S0 defaults. Absent tiers mean fewer layers, never weaker defaults;
 // malformed tiers fail closed. Called EXACTLY ONCE per startup (cmd
 // wiring); uncached, unguarded, never lazily initialized anywhere.
-func LoadHider(fs *FileSystem) (*secrets.Hider, error) {
-	var server, project []secrets.Pattern
+func LoadHider(fs *FileSystem) (*secrets.SecretHider, error) {
+	var server, project []secrets.Secret
 	if raw := strings.TrimSpace(os.Getenv(serverTierEnv)); raw != "" {
 		if err := json.Unmarshal([]byte(raw), &server); err != nil {
 			return nil, fmt.Errorf("%s: %w", serverTierEnv, err)
@@ -47,19 +48,19 @@ func LoadHider(fs *FileSystem) (*secrets.Hider, error) {
 	}
 	switch {
 	case server != nil && project != nil:
-		return secrets.NewHider(server, project)
+		return secrets.NewSecretHider(nil, append(server, project...))
 	case server != nil:
-		return secrets.NewHider(server)
+		return secrets.NewSecretHider(nil, server)
 	case project != nil:
-		return secrets.NewHider(nil, project)
+		return secrets.NewSecretHider(nil, project)
 	default:
-		return secrets.NewHider()
+		return secrets.NewSecretHider(nil, nil)
 	}
 }
 
 // RegisterAllTools registers the eight filesystem tools: content tools
-// share the single startup Hider, metadata tools take fs only.
-func RegisterAllTools(srv *mcp.Server, fs *FileSystem, h *secrets.Hider) error {
+// share the single startup SecretHider, metadata tools take fs only.
+func RegisterAllTools(srv *mcp.Server, fs *FileSystem, h *secrets.SecretHider) error {
 	all := []tools.Tool{
 		ToolReadFile{fs: fs, h: h},
 		ToolReadMultipleFiles{fs: fs, h: h},

@@ -196,7 +196,7 @@ func (g *Git) runGit(ctx context.Context, argv ...string) (string, error) {
 
 // RegisterGitTools registers the four git tools sharing the single
 // startup Hider (mirrors filesystem.RegisterAllTools).
-func RegisterGitTools(srv *mcp.Server, git *Git, h *secrets.Hider) error {
+func RegisterGitTools(srv *mcp.Server, git *Git, h *secrets.SecretHider) error {
 	all := []tools.Tool{
 		ToolGitStatus{git: git},
 		ToolGitDiff{git: git, h: h},

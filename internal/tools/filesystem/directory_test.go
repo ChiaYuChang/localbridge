@@ -6,8 +6,10 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
@@ -630,9 +632,12 @@ func TestListDirectory_Transport(t *testing.T) {
 	if err := (ToolListDirectory{fs: fs}).Register(srv); err != nil {
 		t.Fatal(err)
 	}
-	m := checkShape(t, callTool(t, srv, "list_directory", map[string]any{"path": "."}), map[string]bool{"path": true, "entries": true, "truncated": true})
+	m := checkShape(t, callTool(t, srv, "list_directory", map[string]any{"path": "."}), map[string]bool{"path": true, "sort_by": true, "reverse": true, "include_hidden": true, "entries": true, "truncated": true})
 	if m["path"] != "." {
 		t.Fatalf("path=%v", m["path"])
+	}
+	if m["sort_by"] != "name" || m["reverse"] != false || m["include_hidden"] != true {
+		t.Fatalf("default echoes: %v", m)
 	}
 }
 
@@ -657,5 +662,189 @@ func TestTree_Transport(t *testing.T) {
 		if _, ok := sub[k]; !ok {
 			t.Fatalf("node missing %q: %v", k, sub)
 		}
+	}
+}
+
+func boolPtr(b bool) *bool { return &b }
+
+func namesOf(entries []Entry) []string {
+	names := make([]string, 0, len(entries))
+	for _, e := range entries {
+		names = append(names, e.Name)
+	}
+	return names
+}
+
+func TestListDirectory_Defaults(t *testing.T) {
+	dir := mkRoot(t)
+	writeTempFile(t, dir, "b.txt", "bb")
+	writeTempFile(t, dir, "a.txt", "a")
+	writeTempFile(t, dir, ".dot", "d")
+	fs := openFS(t, dir)
+	tool := ToolListDirectory{fs: fs}
+
+	_, res, err := tool.handle(context.Background(), nil, ToolListDirectoryI{Path: "."})
+	if err != nil {
+		t.Fatalf("handle err: %v", err)
+	}
+	if res.SortBy != "name" || res.Reverse || !res.IncludeHidden {
+		t.Fatalf("echoes: %+v", res)
+	}
+	want := []string{".dot", "a.txt", "b.txt"}
+	if got := namesOf(res.Entries); !slices.Equal(got, want) {
+		t.Fatalf("order=%q want %q", got, want)
+	}
+}
+
+func TestListDirectory_SortAxes(t *testing.T) {
+	dir := mkRoot(t)
+	writeTempFile(t, dir, "small.txt", "a")
+	writeTempFile(t, dir, "big.txt", "0123456789")
+	writeTempFile(t, dir, "mid1.txt", "12345")
+	writeTempFile(t, dir, "mid2.txt", "abcde")
+	base := int64(1700000000)
+	stamp := func(name string, off int64) {
+		ts := time.Unix(base+off, 0)
+		if err := os.Chtimes(filepath.Join(dir, name), ts, ts); err != nil {
+			t.Fatal(err)
+		}
+	}
+	stamp("small.txt", 30)
+	stamp("big.txt", 10)
+	stamp("mid1.txt", 20)
+	stamp("mid2.txt", 20)
+	fs := openFS(t, dir)
+	tool := ToolListDirectory{fs: fs}
+
+	list := func(in ToolListDirectoryI) []string {
+		t.Helper()
+		_, res, err := tool.handle(context.Background(), nil, in)
+		if err != nil {
+			t.Fatalf("handle %+v err: %v", in, err)
+		}
+		return namesOf(res.Entries)
+	}
+	if got, want := list(ToolListDirectoryI{Path: ".", SortBy: "size"}), []string{"small.txt", "mid1.txt", "mid2.txt", "big.txt"}; !slices.Equal(got, want) {
+		t.Fatalf("size asc=%q want %q", got, want)
+	}
+	if got, want := list(ToolListDirectoryI{Path: ".", SortBy: "size", Reverse: true}), []string{"big.txt", "mid2.txt", "mid1.txt", "small.txt"}; !slices.Equal(got, want) {
+		t.Fatalf("size desc=%q want %q", got, want)
+	}
+	if got, want := list(ToolListDirectoryI{Path: ".", SortBy: "mtime"}), []string{"big.txt", "mid1.txt", "mid2.txt", "small.txt"}; !slices.Equal(got, want) {
+		t.Fatalf("mtime asc=%q want %q", got, want)
+	}
+	if got, want := list(ToolListDirectoryI{Path: ".", SortBy: "mtime", Reverse: true}), []string{"small.txt", "mid2.txt", "mid1.txt", "big.txt"}; !slices.Equal(got, want) {
+		t.Fatalf("mtime desc=%q want %q", got, want)
+	}
+	if got, want := list(ToolListDirectoryI{Path: ".", SortBy: "name", Reverse: true}), []string{"small.txt", "mid2.txt", "mid1.txt", "big.txt"}; !slices.Equal(got, want) {
+		t.Fatalf("name desc=%q want %q", got, want)
+	}
+	if _, _, err := tool.handle(context.Background(), nil, ToolListDirectoryI{Path: ".", SortBy: "bogus"}); err == nil || !errors.Is(err, ErrFileRead) {
+		t.Fatalf("invalid sort_by err=%v", err)
+	}
+}
+
+func TestListDirectory_HiddenAndDeny(t *testing.T) {
+	dir := mkRoot(t)
+	writeTempFile(t, dir, "a.txt", "a")
+	writeTempFile(t, dir, ".dot", "d")
+	writeTempFile(t, dir, ".secrets/s.txt", "x")
+	fs := openFS(t, dir)
+	tool := ToolListDirectory{fs: fs}
+
+	_, res, err := tool.handle(context.Background(), nil, ToolListDirectoryI{Path: ".", IncludeHidden: boolPtr(false)})
+	if err != nil {
+		t.Fatalf("handle err: %v", err)
+	}
+	if res.IncludeHidden {
+		t.Fatalf("echo: %+v", res)
+	}
+	if got := namesOf(res.Entries); !slices.Equal(got, []string{"a.txt"}) {
+		t.Fatalf("hidden-off=%q", got)
+	}
+	_, res, err = tool.handle(context.Background(), nil, ToolListDirectoryI{Path: "."})
+	if err != nil {
+		t.Fatalf("handle err: %v", err)
+	}
+	// Denied .secrets pruned even with hidden included.
+	if got := namesOf(res.Entries); !slices.Equal(got, []string{".dot", "a.txt"}) {
+		t.Fatalf("hidden-on=%q", got)
+	}
+}
+
+func TestListDirectory_TruncationAxes(t *testing.T) {
+	dir := mkRoot(t)
+	sub := filepath.Join(dir, "w")
+	if err := os.Mkdir(sub, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	base := int64(1700000000)
+	for i := 0; i < 1001; i++ {
+		name := "f" + itoa(i) + ".txt"
+		data := strings.Repeat("x", i+1)
+		if err := os.WriteFile(filepath.Join(sub, name), []byte(data), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		ts := time.Unix(base+int64(i), 0)
+		if err := os.Chtimes(filepath.Join(sub, name), ts, ts); err != nil {
+			t.Fatal(err)
+		}
+	}
+	fs := openFS(t, dir)
+	tool := ToolListDirectory{fs: fs}
+
+	_, res, err := tool.handle(context.Background(), nil, ToolListDirectoryI{Path: "w", SortBy: "size", Reverse: true})
+	if err != nil || !res.Truncated || len(res.Entries) != 1000 {
+		t.Fatalf("size-desc trunc: n=%d trunc=%v err=%v", len(res.Entries), res.Truncated, err)
+	}
+	if res.Entries[0].Size != 1001 || res.Entries[999].Size != 2 {
+		t.Fatalf("retained largest: %d..%d", res.Entries[0].Size, res.Entries[999].Size)
+	}
+	_, res, err = tool.handle(context.Background(), nil, ToolListDirectoryI{Path: "w", SortBy: "mtime", Reverse: true})
+	if err != nil || !res.Truncated || len(res.Entries) != 1000 {
+		t.Fatalf("mtime-desc trunc: n=%d trunc=%v err=%v", len(res.Entries), res.Truncated, err)
+	}
+	if res.Entries[0].Name != "f1000.txt" || res.Entries[999].Name != "f0001.txt" {
+		t.Fatalf("retained newest: %q..%q", res.Entries[0].Name, res.Entries[999].Name)
+	}
+}
+
+func TestListDirectory_TransportDecode(t *testing.T) {
+	dir := mkRoot(t)
+	writeTempFile(t, dir, ".dot", "d")
+	writeTempFile(t, dir, "a.txt", "a")
+	fs := openFS(t, dir)
+	srv := mcp.NewServer(&mcp.Implementation{Name: "test", Version: "0.0.1"}, nil)
+	if err := (ToolListDirectory{fs: fs}).Register(srv); err != nil {
+		t.Fatal(err)
+	}
+	pathsOf := func(m map[string]any) []string {
+		var out []string
+		for _, e := range m["entries"].([]any) {
+			out = append(out, e.(map[string]any)["name"].(string))
+		}
+		return out
+	}
+	m := checkShape(t, callTool(t, srv, "list_directory", map[string]any{"path": "."}), map[string]bool{"path": true, "sort_by": true, "reverse": true, "include_hidden": true, "entries": true, "truncated": true})
+	if m["sort_by"] != "name" || m["reverse"] != false || m["include_hidden"] != true {
+		t.Fatalf("omitted echoes: %v", m)
+	}
+	if got := pathsOf(m); !slices.Equal(got, []string{".dot", "a.txt"}) {
+		t.Fatalf("omitted entries=%q", got)
+	}
+	m = checkShape(t, callTool(t, srv, "list_directory", map[string]any{"path": ".", "include_hidden": true, "sort_by": "name"}), map[string]bool{"path": true, "sort_by": true, "reverse": true, "include_hidden": true, "entries": true, "truncated": true})
+	if m["include_hidden"] != true {
+		t.Fatalf("explicit true: %v", m)
+	}
+	m = checkShape(t, callTool(t, srv, "list_directory", map[string]any{"path": ".", "include_hidden": false}), map[string]bool{"path": true, "sort_by": true, "reverse": true, "include_hidden": true, "entries": true, "truncated": true})
+	if m["include_hidden"] != false {
+		t.Fatalf("explicit false: %v", m)
+	}
+	if got := pathsOf(m); !slices.Equal(got, []string{"a.txt"}) {
+		t.Fatalf("false entries=%q", got)
+	}
+	m = checkShape(t, callTool(t, srv, "list_directory", map[string]any{"path": ".", "include_hidden": nil, "sort_by": "size", "reverse": true}), map[string]bool{"path": true, "sort_by": true, "reverse": true, "include_hidden": true, "entries": true, "truncated": true})
+	if m["include_hidden"] != true || m["sort_by"] != "size" || m["reverse"] != true {
+		t.Fatalf("null+opts echoes: %v", m)
 	}
 }

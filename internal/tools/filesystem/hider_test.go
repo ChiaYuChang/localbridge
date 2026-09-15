@@ -7,8 +7,16 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/ChiaYuChang/local-mcp/internal/tools/secrets"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
+
+func secretsNewUnifiedForTest() (*secrets.SecretHider, error) {
+	return secrets.NewSecretHider(nil, []secrets.Secret{
+		{Pattern: `SRV-[0-9]+`, Replace: "[SRV]"},
+		{Pattern: `CORP-[0-9]+`, Replace: "[CORP]"},
+	})
+}
 
 func TestLoadHiderDefaults(t *testing.T) {
 	dir := t.TempDir()
@@ -46,6 +54,17 @@ func TestLoadHiderTiers(t *testing.T) {
 	}
 	if got := h.Redact("SRV-1 CORP-2 sk-abcdefghijklmnop1234"); got != "[SRV] [CORP] [REDACTED:API_KEY]" {
 		t.Fatalf("tiers inactive: %q", got)
+	}
+	// Old-tier corpus proof: `Regex`-key rows (above) unmarshal through the
+	// new `regex` tag and redact identically to explicit new-key rows.
+	want, err := secretsNewUnifiedForTest()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, in := range []string{"SRV-1 CORP-2 sk-abcdefghijklmnop1234", "plain", "SRV-9"} {
+		if got, want := h.Redact(in), want.Redact(in); got != want {
+			t.Fatalf("old-corpus mismatch for %q: %q vs %q", in, got, want)
+		}
 	}
 }
 

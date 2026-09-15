@@ -26,7 +26,7 @@ type ToolGitShowO struct {
 
 type ToolGitShow struct {
 	git *Git
-	h   *secrets.Hider
+	h   *secrets.SecretHider
 }
 
 var _ tools.Tool = ToolGitShow{}

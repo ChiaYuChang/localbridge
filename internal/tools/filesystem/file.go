@@ -47,7 +47,7 @@ type ToolReadFileO struct {
 
 type ToolReadFile struct {
 	fs *FileSystem
-	h  *secrets.Hider
+	h  *secrets.SecretHider
 }
 
 var _ tools.Tool = ToolReadFile{}
@@ -265,7 +265,7 @@ type ToolReadMultipleFilesO struct {
 
 type ToolReadMultipleFiles struct {
 	fs *FileSystem
-	h  *secrets.Hider
+	h  *secrets.SecretHider
 }
 
 var _ tools.Tool = ToolReadMultipleFiles{}

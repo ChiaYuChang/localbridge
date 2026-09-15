@@ -1,6 +1,7 @@
 package filesystem
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
@@ -114,13 +115,19 @@ func displayTarget(root *os.Root, dirRel, name string) string {
 }
 
 type ToolListDirectoryI struct {
-	Path string `json:"path"`
+	Path          string `json:"path"`
+	SortBy        string `json:"sort_by,omitempty"`
+	Reverse       bool   `json:"reverse,omitempty"`
+	IncludeHidden *bool  `json:"include_hidden,omitempty"`
 }
 
 type ToolListDirectoryO struct {
-	Path      string  `json:"path"`
-	Entries   []Entry `json:"entries"`
-	Truncated bool    `json:"truncated,omitempty"`
+	Path          string  `json:"path"`
+	SortBy        string  `json:"sort_by"`
+	Reverse       bool    `json:"reverse"`
+	IncludeHidden bool    `json:"include_hidden"`
+	Entries       []Entry `json:"entries"`
+	Truncated     bool    `json:"truncated,omitempty"`
 }
 
 type ToolListDirectory struct {
@@ -146,31 +153,94 @@ func (t ToolListDirectory) formatError(path string, err error) error {
 	return fmt.Errorf("%q: %w%s", path, err, verdict)
 }
 
-func (t ToolListDirectory) check(path string) (*os.File, error) {
-	if secrets.Denied(path) {
-		return nil, ErrFileOpen
+// listOpts carries validated effective list options: sort_by normalized
+// (default name), reverse as given, include_hidden defaulting true.
+type listOpts struct {
+	sortBy        string
+	reverse       bool
+	includeHidden bool
+}
+
+func (t ToolListDirectory) check(in ToolListDirectoryI) (*os.File, listOpts, error) {
+	o := listOpts{sortBy: "name", reverse: in.Reverse, includeHidden: true}
+	if in.SortBy != "" {
+		o.sortBy = in.SortBy
 	}
-	f, err := t.fs.root.Open(path)
+	switch o.sortBy {
+	case "name", "size", "mtime":
+	default:
+		return nil, listOpts{}, fmt.Errorf("invalid sort_by %q: %w", in.SortBy, ErrFileRead)
+	}
+	if in.IncludeHidden != nil {
+		o.includeHidden = *in.IncludeHidden
+	}
+	if secrets.Denied(in.Path) {
+		return nil, listOpts{}, ErrFileOpen
+	}
+	f, err := t.fs.root.Open(in.Path)
 	if err != nil {
-		return nil, ErrFileOpen
+		return nil, listOpts{}, ErrFileOpen
 	}
 	info, err := f.Stat()
 	if err != nil {
 		f.Close()
-		return nil, ErrFileOpen
+		return nil, listOpts{}, ErrFileOpen
 	}
 	if !info.IsDir() {
 		f.Close()
-		return nil, ErrNotAFile
+		return nil, listOpts{}, ErrNotAFile
 	}
-	return f, nil
+	return f, o, nil
 }
 
-func (t ToolListDirectory) do(dir *os.File, rel string) ([]Entry, bool, error) {
-	entries, err := listEntries(t.fs.root, dir, rel)
-	if err != nil {
-		return nil, false, err
+// sortEntries orders by field ascending (size/mtime compose with reverse;
+// name is byte-wise), name tiebreak, whole comparison reversed when asked:
+// total deterministic order on every axis.
+func sortEntries(entries []Entry, sortBy string, reverse bool) {
+	slices.SortFunc(entries, func(a, b Entry) int {
+		var c int
+		switch sortBy {
+		case "size":
+			c = cmp.Compare(a.Size, b.Size)
+		case "mtime":
+			c = a.ModTime.Compare(b.ModTime)
+		default:
+			c = strings.Compare(a.Name, b.Name)
+		}
+		if c == 0 {
+			c = strings.Compare(a.Name, b.Name)
+		}
+		if reverse {
+			c = -c
+		}
+		return c
+	})
+}
+
+// do enumerates, describes, deny-prunes, hidden-filters, sorts, then
+// truncates: retained set is always the first ListMaxEntries IN SORT ORDER
+// (never describe-then-cut in readdir order).
+func (t ToolListDirectory) do(dir *os.File, rel string, o listOpts) ([]Entry, bool, error) {
+	des, err := dir.ReadDir(-1)
+	if err != nil && !errors.Is(err, io.EOF) {
+		return nil, false, ErrFileRead
 	}
+	slices.SortFunc(des, func(a, b os.DirEntry) int { return strings.Compare(a.Name(), b.Name()) })
+	entries := make([]Entry, 0, len(des))
+	for _, de := range des {
+		e, err := describeEntry(t.fs.root, rel, de)
+		if err != nil {
+			return nil, false, err
+		}
+		if secrets.Denied(path.Join(rel, e.Name)) {
+			continue
+		}
+		if !o.includeHidden && strings.HasPrefix(e.Name, ".") {
+			continue
+		}
+		entries = append(entries, e)
+	}
+	sortEntries(entries, o.sortBy, o.reverse)
 	if len(entries) > ListMaxEntries {
 		return entries[:ListMaxEntries], true, nil
 	}
@@ -182,18 +252,18 @@ func (t ToolListDirectory) handle(
 	_ *mcp.CallToolRequest,
 	in ToolListDirectoryI,
 ) (*mcp.CallToolResult, ToolListDirectoryO, error) {
-	f, err := t.check(in.Path)
+	f, o, err := t.check(in)
 	if err != nil {
 		return nil, ToolListDirectoryO{}, t.formatError(in.Path, err)
 	}
 	defer f.Close()
 
-	entries, truncated, err := t.do(f, in.Path)
+	entries, truncated, err := t.do(f, in.Path, o)
 	if err != nil {
 		return nil, ToolListDirectoryO{}, t.formatError(in.Path, err)
 	}
 
-	out := ToolListDirectoryO{Path: in.Path, Entries: entries, Truncated: truncated}
+	out := ToolListDirectoryO{Path: in.Path, SortBy: o.sortBy, Reverse: o.reverse, IncludeHidden: o.includeHidden, Entries: entries, Truncated: truncated}
 	text, _ := json.MarshalIndent(out, "", "  ")
 	return &mcp.CallToolResult{
 		Content: []mcp.Content{
@@ -207,7 +277,7 @@ func (t ToolListDirectory) Register(srv *mcp.Server) error {
 		srv,
 		&mcp.Tool{
 			Name:        t.Name(),
-			Description: "List a directory's entries (max 1000, symlinks shown with targets and never followed, .secrets subtree denied).",
+			Description: "List a directory's entries (max 1000 post-sort, sort by name/size/mtime default name, hidden included by default, symlinks shown with targets and never followed, .secrets denied).",
 		},
 		t.handle,
 	)

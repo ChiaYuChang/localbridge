@@ -12,8 +12,8 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
-func secretsNewHiderForTest() (*secrets.Hider, error) {
-	return secrets.NewHider()
+func secretsNewHiderForTest() (*secrets.SecretHider, error) {
+	return secrets.NewSecretHider(nil, nil)
 }
 
 func findSearchEntry(entries []SearchFileEntry, name string) *SearchFileEntry {

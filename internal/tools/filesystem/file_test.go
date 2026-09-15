@@ -13,9 +13,9 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
-func testHider(t *testing.T) *secrets.Hider {
+func testHider(t *testing.T) *secrets.SecretHider {
 	t.Helper()
-	h, err := secrets.NewHider()
+	h, err := secrets.NewSecretHider(nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

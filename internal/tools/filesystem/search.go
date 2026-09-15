@@ -70,7 +70,7 @@ type ToolSearchFilesO struct {
 
 type ToolSearchFiles struct {
 	fs *FileSystem
-	h  *secrets.Hider
+	h  *secrets.SecretHider
 }
 
 var _ tools.Tool = ToolSearchFiles{}
@@ -212,7 +212,7 @@ type ToolSearchWithinFilesO struct {
 
 type ToolSearchWithinFiles struct {
 	fs *FileSystem
-	h  *secrets.Hider
+	h  *secrets.SecretHider
 }
 
 var _ tools.Tool = ToolSearchWithinFiles{}
