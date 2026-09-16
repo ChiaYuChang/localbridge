@@ -63,8 +63,9 @@
 
 ## Active State & In-Flight Context
 
-- **Observed-At**: `2026-09-17T03:35:32Z @ 0ee871e6 (change ntzuyzwn; sealed parent plstokrq 78259038 feat(jj) incl. seal-state)`
+- **Observed-At**: `2026-09-17T04:33:05Z @ 7978b8ce (change xxlsrqlp; sealed parent knqpzowm 3944f258 refactor(secrets) incl. seal-state)`
 - **Dirty Status**: `dirty (AGENTS.md seal-state update only; sealed change clean)`
-- **Milestone**: `COMMIT_SEALED - feat(jj): read-only status/diff/log/show tools @ 78259038; local only, no push`
-- **Next Pickup Item**: `Next task planning; blueprint fully sealed through S3`
+- **Milestone**: `S0-HARDEN REVIEW_PASS - secrets private rules + rerun + tags (23/23 -race), joint online consensus; sealing`
+- **Next Pickup Item**: `Post-seal: gateway blueprint (S4) or operator task`
+- **Commit Ordering Rule**: All `AGENTS.md` content updates land PRE-seal; post-seal only `Observed-At` is squashed in (mechanical, keeps tree clean).
 - **Ground Truth Revalidation Invariant**: Cold-start Planners MUST run fresh VCS status/log inspection; never trust cached Active State.

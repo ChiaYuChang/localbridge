@@ -2,7 +2,9 @@ package secrets
 
 import (
 	"encoding/json"
+	"reflect"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -372,6 +374,119 @@ func TestNewSecretHiderExtrasCannotSuppressDefault(t *testing.T) {
 	if strings.Contains(got, "[CUSTOM]") {
 		t.Fatalf("extra overwrote default: %q", got)
 	}
+}
+
+func TestSecretTagParity(t *testing.T) {
+	// yaml tags must mirror json tags exactly (no renames); `re` is the
+	// unexported compiled state and carries no tags.
+	rt := reflect.TypeOf(Secret{})
+	for i := 0; i < rt.NumField(); i++ {
+		f := rt.Field(i)
+		if f.Name == "re" {
+			continue
+		}
+		if got, want := f.Tag.Get("yaml"), f.Tag.Get("json"); got == "" || got != want {
+			t.Errorf("field %s: yaml %q vs json %q", f.Name, got, want)
+		}
+	}
+}
+
+func TestNewSecretHiderImmutability(t *testing.T) {
+	// Every post-construction mutation route must leave behavior
+	// unchanged: original inputs, snapshot fields, aliased Enable
+	// pointer, re-Compile() of a snapshot row.
+	en := boolPtr(true)
+	builtinIn := []Secret{{Pattern: `TOKEN-[0-9]+`, Replace: "[CUSTOM]"}}
+	extraIn := []Secret{{Pattern: `CORP-[A-Z]+`, Replace: "[CORP]", Enable: en}}
+	h, err := NewSecretHider(builtinIn, extraIn)
+	if err != nil {
+		t.Fatalf("NewSecretHider err: %v", err)
+	}
+	in := "see TOKEN-123 and CORP-ABC plus sk-abcdefghijklmnop1234"
+	want := h.Redact(in)
+	// Route (a): mutate the caller's original slices.
+	builtinIn[0].Replace = "[MUT]"
+	builtinIn[0].Pattern = "zzz"
+	extraIn[0].Replace = "[MUT]"
+	// Route (c): flip the caller's aliased Enable pointer.
+	*en = false
+	// Route (b): mutate snapshot fields; snapshot Enable must be a fresh
+	// bool, never the caller's pointer.
+	if h.Extra[0].Enable == en {
+		t.Fatalf("snapshot Enable aliases caller memory")
+	}
+	if h.Extra[0].Enable == nil || !*h.Extra[0].Enable {
+		t.Fatalf("snapshot Enable must hold the compile-time value")
+	}
+	h.Builtin[5].Replace = "[MUT]"
+	h.Extra[0].Replace = "[MUT]"
+	// Route (d): re-Compile() a snapshot row after repointing it.
+	h.Extra[0].Pattern = "zzz"
+	if err := h.Extra[0].Compile(); err != nil {
+		t.Fatalf("snapshot re-Compile err: %v", err)
+	}
+	if got := h.Redact(in); got != want {
+		t.Fatalf("behavior changed by post-construction mutation: %q vs %q", got, want)
+	}
+}
+
+func TestNewSecretHiderFrozenRerun(t *testing.T) {
+	// Synthesis: the extra replacement assembles a frozen shape mid-pass
+	// ("ZZZ"+tail -> "sk-"+tail); the final frozen rerun must close it.
+	h, err := NewSecretHider(nil, []Secret{{Pattern: `ZZZ`, Replace: "sk-"}})
+	if err != nil {
+		t.Fatalf("NewSecretHider err: %v", err)
+	}
+	got := h.Redact("ZZZabcdefghijklmnop1234")
+	if strings.Contains(got, "sk-abcdef") {
+		t.Fatalf("synthesized secret survived: %q", got)
+	}
+	if !strings.Contains(got, "[REDACTED:API_KEY]") {
+		t.Fatalf("rerun missed frozen shape: %q", got)
+	}
+	// Mid-string synthesis with delimiter: the rerun must take the same
+	// Lead boundary+delimiter path as main rows (a literal whole-match
+	// replacement would eat the preceding space).
+	hd, err := NewSecretHider(nil, []Secret{{Pattern: `QQQ`, Replace: " sk-"}})
+	if err != nil {
+		t.Fatalf("NewSecretHider err: %v", err)
+	}
+	if got := hd.Redact("x QQQabcdefghijklmnop1234 y"); got != "x  [REDACTED:API_KEY] y" {
+		t.Fatalf("delimiter synthesis: got %q", got)
+	}
+}
+
+func TestRedactLeadMultibyte(t *testing.T) {
+	// Lead is left-boundary-only; a multibyte delimiter must survive
+	// intact (submatch slicing never splits UTF-8).
+	in := "中sk-abcdefghijklmnop1234尾"
+	want := "中[REDACTED:API_KEY]尾"
+	if got := stdHider.Redact(in); got != want {
+		t.Fatalf("Redact(%q) = %q, want %q", in, got, want)
+	}
+}
+
+func TestRedactConcurrent(t *testing.T) {
+	h, err := NewSecretHider(nil, []Secret{{Pattern: `TOKEN-[0-9]+`, Replace: "[TOK]", Lead: true}})
+	if err != nil {
+		t.Fatalf("NewSecretHider err: %v", err)
+	}
+	in := "see TOKEN-123 plus sk-abcdefghijklmnop1234"
+	want := h.Redact(in)
+	var wg sync.WaitGroup
+	for i := 0; i < 16; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 50; j++ {
+				if got := h.Redact(in); got != want {
+					t.Errorf("concurrent Redact mismatch: %q vs %q", got, want)
+					return
+				}
+			}
+		}()
+	}
+	wg.Wait()
 }
 
 func TestNewSecretHiderIdempotenceWithExtras(t *testing.T) {

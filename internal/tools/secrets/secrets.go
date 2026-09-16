@@ -1,7 +1,9 @@
-// Package secrets is the single choke point for secret safety in tool
-// output: Denied blocks reads under the root-anchored .secrets subtree
-// before open, and SecretHider masks high-signal secret shapes before
-// return. One Secret row type for builtin and extra rows
+// Package secrets is a pattern-based masker applied to selected textual
+// MCP payload fields; binary/structured untouched; frozen table
+// necessarily incomplete. It is the single choke point for secret safety
+// in tool output: Denied blocks reads under the root-anchored .secrets
+// subtree before open, and SecretHider masks high-signal secret shapes
+// before return. One Secret row type for builtin and extra rows
 // (logic-undifferentiated; grouping only sets order); frozen built-in
 // defaults with additive user rows via NewSecretHider (never subtractive);
 // invalid user input fails construction closed.
@@ -21,6 +23,12 @@ import (
 // to slash) and the result is cleaned with path.Clean; absolute paths are
 // denied outright. Empty path is denied.
 //
+// Denied is a convenience guard, not a security boundary: it covers only
+// the root-anchored name, so alias reads (symlinks, case variants on some
+// filesystems, `..`-normalized equivalents resolving elsewhere) can still
+// reach the bytes — but every such byte still passes through the Hider,
+// which is the backstop. Container/filesystem policy is the outer layer.
+//
 // .gitignore is never consulted: gitignored dev notes must stay readable;
 // only the exact .secrets name at the root is blocked.
 func Denied(relPath string) bool {
@@ -37,16 +45,22 @@ func Denied(relPath string) bool {
 
 // Secret is one redaction row for builtin and extra rows alike. Pattern
 // uses the external `regex` key (existing tier corpus keeps working;
-// matching is case-insensitive per encoding/json). Enable is honored for
-// Extra rows only (nil = enabled); Builtin rows always fire. Lead marks a
-// row whose first group is a single leading boundary char preserved
-// verbatim in output while replacement stays literal. re is set by Compile.
+// matching is case-insensitive per encoding/json); `yaml` tags mirror
+// every `json` tag for tier files parsed as YAML. Enable is honored for
+// Extra rows only (nil = enabled); Builtin rows always fire. The key
+// stays `enable`: server-config `enabled` is a different file's
+// convention, not this struct's. Kind is an optional label with no
+// behavioral effect (never required; labeling-only, not surfaced in
+// errors). Lead marks a row whose first group is a single leading
+// boundary char preserved verbatim in output while replacement stays
+// literal; Lead is left-boundary-only, not a symmetric word boundary. re
+// is set by Compile.
 type Secret struct {
-	Pattern string `json:"regex"`
-	Enable  *bool  `json:"enable"`
-	Kind    string `json:"kind"`
-	Replace string `json:"replace"`
-	Lead    bool   `json:"lead"`
+	Pattern string `json:"regex" yaml:"regex"`
+	Enable  *bool  `json:"enable" yaml:"enable"`
+	Kind    string `json:"kind" yaml:"kind"`
+	Replace string `json:"replace" yaml:"replace"`
+	Lead    bool   `json:"lead" yaml:"lead"`
 	re      *regexp.Regexp
 }
 
@@ -80,17 +94,51 @@ func (s *Secret) Compile() error {
 	return nil
 }
 
+// rule is the compiled behavior row. Redaction flows exclusively through
+// private rules; exported Secret slices are inspection snapshots only.
+type rule struct {
+	re      *regexp.Regexp
+	replace string
+	lead    bool
+	enabled bool
+}
+
 // SecretHider applies frozen built-in rows then additive user layers in
-// order. Construct via NewSecretHider; the zero value is not usable.
+// order, with a final frozen rerun (see Redact). Construct via
+// NewSecretHider; the zero value is not usable.
+//
+// Builtin/Extra are inspection-only compatibility snapshots: deep copies
+// of the construction inputs (including fresh Enable bools), never
+// consulted by Redact. Mutating them — or the caller's original slices,
+// or re-Compile()ing a snapshot row — has zero behavioral effect. They
+// are snapshots, not live configuration (Go cannot enforce immutability
+// on exported slices, so behavior simply never reads them).
 type SecretHider struct {
 	Builtin []Secret
 	Extra   []Secret
+	rules   []rule
+	frozen  []rule
 }
 
-// NewSecretHider compiles every row (addressable elements, never range
-// copies): frozen defaults ALWAYS prepended (additive-only — caller
-// builtin rows can never suppress a frozen default), then caller builtin
-// rows, then extra rows; failing closed naming builtin[i]/extra[i].
+// snapshotRow deep-copies one input row for inspection storage: fresh
+// Enable bool (never aliasing caller memory), compiled state dropped.
+func snapshotRow(s Secret) Secret {
+	c := s
+	c.re = nil
+	if s.Enable != nil {
+		e := *s.Enable
+		c.Enable = &e
+	}
+	return c
+}
+
+// NewSecretHider compiles every row (throwaway copies, never range
+// copies, never mutating caller slices): frozen defaults ALWAYS
+// prepended (additive-only — caller builtin rows can never suppress a
+// frozen default), then caller builtin rows, then extra rows; failing
+// closed naming builtin[i]/extra[i]. Enable is resolved at compile time
+// (nil = enabled; Extra-only honored; Builtin always enabled). Behavior
+// flows into private rules; Builtin/Extra store deep-copied snapshots.
 // Validation carried over: self-matching replacements, matches against
 // frozen builtin markers, cross-row replacement matches, and poison
 // replacements (secret-shaped output a second pass would redact) — all
@@ -98,16 +146,17 @@ type SecretHider struct {
 // over-redact, never weaken defaults. Callers getting an error must
 // refuse to operate, never run degraded.
 func NewSecretHider(builtin, extra []Secret) (*SecretHider, error) {
-	b := append(slices.Clone(frozenTable), builtin...)
-	e := slices.Clone(extra)
-	frozen := slices.Clone(frozenTable)
-	for i := range frozen {
-		if err := frozen[i].Compile(); err != nil {
+	raw := append(slices.Clone(frozenTable), builtin...)
+	// Validate the frozen constant itself while compiling it (a broken
+	// constant fails construction rather than serving degraded).
+	frozenRules := make([]rule, 0, len(frozenTable))
+	markers := make([]string, 0, len(frozenTable))
+	for _, f := range frozenTable {
+		tmp := f
+		if err := tmp.Compile(); err != nil {
 			return nil, err
 		}
-	}
-	markers := make([]string, 0, len(frozen))
-	for _, f := range frozen {
+		frozenRules = append(frozenRules, rule{re: tmp.re, replace: f.Replace, lead: f.Lead, enabled: true})
 		markers = append(markers, f.Replace)
 	}
 	type taggedReplace struct {
@@ -129,62 +178,81 @@ func NewSecretHider(builtin, extra []Secret) (*SecretHider, error) {
 				return fmt.Errorf("%s[%d]: pattern matches %s[%d] replacement", tag, i, q.tag, q.idx)
 			}
 		}
-		for _, f := range frozen {
+		for _, f := range frozenRules {
 			if f.re.MatchString(r.Replace) {
-				return fmt.Errorf("%s[%d]: replacement is secret-shaped (%s)", tag, i, f.Kind)
+				return fmt.Errorf("%s[%d]: replacement is secret-shaped (%s)", tag, i, "frozen")
 			}
 		}
 		return nil
 	}
-	replaces := make([]taggedReplace, 0, len(b)+len(e))
-	for i, r := range b {
+	replaces := make([]taggedReplace, 0, len(raw)+len(extra))
+	for i, r := range raw {
 		replaces = append(replaces, taggedReplace{tag: "builtin", idx: i, text: r.Replace})
 	}
-	for i, r := range e {
+	for i, r := range extra {
 		replaces = append(replaces, taggedReplace{tag: "extra", idx: i, text: r.Replace})
 	}
-	for i := range b {
-		if err := b[i].Compile(); err != nil {
+	rules := make([]rule, 0, len(raw)+len(extra))
+	snapBuiltin := make([]Secret, 0, len(raw))
+	for i, r := range raw {
+		tmp := r
+		if err := tmp.Compile(); err != nil {
 			return nil, fmt.Errorf("builtin[%d]: %w", i, err)
 		}
-		if err := checkRow("builtin", i, b[i], replaces); err != nil {
+		if err := checkRow("builtin", i, tmp, replaces); err != nil {
 			return nil, err
 		}
+		// Builtin rows always fire; Enable never consulted.
+		rules = append(rules, rule{re: tmp.re, replace: r.Replace, lead: r.Lead, enabled: true})
+		snapBuiltin = append(snapBuiltin, snapshotRow(r))
 	}
-	for i := range e {
-		if err := e[i].Compile(); err != nil {
+	snapExtra := make([]Secret, 0, len(extra))
+	for i, r := range extra {
+		tmp := r
+		if err := tmp.Compile(); err != nil {
 			return nil, fmt.Errorf("extra[%d]: %w", i, err)
 		}
-		if err := checkRow("extra", i, e[i], replaces); err != nil {
+		if err := checkRow("extra", i, tmp, replaces); err != nil {
 			return nil, err
 		}
+		enabled := r.Enable == nil || *r.Enable
+		rules = append(rules, rule{re: tmp.re, replace: r.Replace, lead: r.Lead, enabled: enabled})
+		snapExtra = append(snapExtra, snapshotRow(r))
 	}
-	return &SecretHider{Builtin: b, Extra: e}, nil
+	return &SecretHider{Builtin: snapBuiltin, Extra: snapExtra, rules: rules, frozen: frozenRules}, nil
 }
 
-func applyRow(r Secret, s string) string {
-	if !r.Lead {
-		return r.re.ReplaceAllLiteralString(s, r.Replace)
+func (r rule) apply(s string) string {
+	if !r.lead {
+		return r.re.ReplaceAllLiteralString(s, r.replace)
 	}
+	// Byte-correct by construction: Go regexp matches land on rune
+	// boundaries, so the captured delimiter is a complete rune (or the
+	// empty start anchor) — multibyte delimiters survive intact.
 	return r.re.ReplaceAllStringFunc(s, func(m string) string {
-		return r.re.FindStringSubmatch(m)[1] + r.Replace
+		return r.re.FindStringSubmatch(m)[1] + r.replace
 	})
 }
 
-// Redact masks frozen built-in shapes then user layers in order, with
-// literal replacement (Lead rows preserve their boundary delimiter).
-// Builtin rows ALWAYS fire (Enable never consulted); Extra rows skip via
-// nil-guarded Enable. Output is stable for fixed input and idempotent:
-// bracket replacements contain no pattern trigger.
+// Redact masks frozen built-in shapes then user layers in order, then
+// reruns the frozen layer once (post-replacement synthesis: a user
+// replacement could assemble a frozen shape mid-pass; the rerun closes it
+// for the mandatory layer). Replacement stays literal (Lead rows preserve
+// their boundary delimiter). Builtin rules ALWAYS fire; disabled Extra
+// rules were resolved out at compile time. Output is stable for fixed
+// input: static checks reject obvious cycles/poisoning (self-matching,
+// marker, cross-row, poison replacements), and the frozen rerun closes
+// synthesis for the mandatory layer — the idempotence claim extends only
+// this far, not to arbitrary user-row fixpoints.
 func (h *SecretHider) Redact(s string) string {
-	for _, b := range h.Builtin {
-		s = applyRow(b, s)
-	}
-	for _, e := range h.Extra {
-		if e.Enable != nil && !*e.Enable {
+	for _, r := range h.rules {
+		if !r.enabled {
 			continue
 		}
-		s = applyRow(e, s)
+		s = r.apply(s)
+	}
+	for _, r := range h.frozen {
+		s = r.apply(s)
 	}
 	return s
 }
