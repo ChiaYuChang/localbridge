@@ -5,6 +5,7 @@ go 1.27.0
 require (
 	github.com/modelcontextprotocol/go-sdk v1.7.0
 	github.com/openai/tunnel-client v0.0.14
+	go.yaml.in/yaml/v3 v3.0.5
 )
 
 require (

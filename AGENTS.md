@@ -63,9 +63,9 @@
 
 ## Active State & In-Flight Context
 
-- **Observed-At**: `2026-09-17T04:33:05Z @ 7978b8ce (change xxlsrqlp; sealed parent knqpzowm 3944f258 refactor(secrets) incl. seal-state)`
-- **Dirty Status**: `dirty (AGENTS.md seal-state update only; sealed change clean)`
-- **Milestone**: `S0-HARDEN REVIEW_PASS - secrets private rules + rerun + tags (23/23 -race), joint online consensus; sealing`
-- **Next Pickup Item**: `Post-seal: gateway blueprint (S4) or operator task`
-- **Commit Ordering Rule**: All `AGENTS.md` content updates land PRE-seal; post-seal only `Observed-At` is squashed in (mechanical, keeps tree clean).
+- **Observed-At**: `2026-09-17T20:04:49Z - feat(config): declarative server config with profiles (sealed)`
+- **Dirty Status**: `dirty (AGENTS.md ordering-rule + Observed-At format change only)`
+- **Milestone**: `COMMIT_SEALED - feat(config); local only, no push`
+- **Next Pickup Item**: `Draft G2 transport/session sub-plan pair on operator go`
+- **Commit Ordering Rule**: All `AGENTS.md` content updates land PRE-seal. `Observed-At` carries timestamp + sealed message only, never commit hashes (hashes mutate on squash and live authoritatively in `jj log`); no post-seal squash cycle exists.
 - **Ground Truth Revalidation Invariant**: Cold-start Planners MUST run fresh VCS status/log inspection; never trust cached Active State.
