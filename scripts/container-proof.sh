@@ -82,6 +82,14 @@ chmod +x "$CANARY"
 echo "== build"
 timeout "$BUILD_TIMEOUT" docker build -t "$IMAGE" -f Dockerfile . || fail "docker build"
 
+# ---- 1b. build-test stage (deferred live rows live here, not in a
+# serve mode): gateway composition, natives, git/jj integration,
+# sanitized child env, proxy child start/stop — proven at build time.
+# Never credited with mount/PID1/stop semantics (runtime rows below)
+# and vice versa.
+echo "== build-test-stage"
+timeout "$BUILD_TIMEOUT" docker build --target test -t local-mcp:test -f Dockerfile . || fail "test stage"
+
 # ---- 2. Volumes null (image stays plain) ----
 echo "== volumes-null"
 VOLUMES=$(docker inspect "$IMAGE" -f '{{json .Config.Volumes}}')

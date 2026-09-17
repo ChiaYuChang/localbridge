@@ -80,13 +80,27 @@ func (o Options) resolve() (Options, error) {
 	return o, nil
 }
 
+// ListChangedHandler receives downstream tool-list-changed
+// notifications when the server sends them. G4 passes a recording stub
+// to prove the path reachable-but-wired-off; nil preserves exact current
+// behavior. At most one handler; more is a construction error.
+func clientOpts(onListChanged []func(context.Context, *mcp.ToolListChangedRequest)) (*mcp.ClientOptions, error) {
+	if len(onListChanged) > 1 {
+		return nil, fmt.Errorf("proxy: at most one list-changed handler")
+	}
+	if len(onListChanged) == 0 || onListChanged[0] == nil {
+		return nil, nil
+	}
+	return &mcp.ClientOptions{ToolListChangedHandler: onListChanged[0]}, nil
+}
+
 // DialStdio spawns command[0] with args, stdin/stdout pipes, and a child
 // env that EQUALS baseline+explicit (G1 BuildEnv — verified by test), then
 // runs the bounded Connect/initialize handshake. The handshake ctx is
 // owned here (ConnectTimeout); a spawned-but-silent child fails
 // construction within the bound (no startup hang). No separate Tools
 // probe: redundant with the Connect handshake (gate note).
-func DialStdio(ctx context.Context, command []string, env map[string]string, opts Options) (Session, error) {
+func DialStdio(ctx context.Context, command []string, env map[string]string, opts Options, onListChanged ...func(context.Context, *mcp.ToolListChangedRequest)) (Session, error) {
 	if len(command) == 0 || command[0] == "" {
 		return nil, fmt.Errorf("proxy: stdio command required")
 	}
@@ -94,9 +108,13 @@ func DialStdio(ctx context.Context, command []string, env map[string]string, opt
 	if err != nil {
 		return nil, err
 	}
+	copts, err := clientOpts(onListChanged)
+	if err != nil {
+		return nil, err
+	}
 	cmd := exec.Command(command[0], command[1:]...)
 	cmd.Env = config.BuildEnv(os.Environ(), env)
-	client := mcp.NewClient(&mcp.Implementation{Name: "proxy", Version: "0.0.1"}, nil)
+	client := mcp.NewClient(&mcp.Implementation{Name: "proxy", Version: "0.0.1"}, copts)
 	t := &mcp.CommandTransport{Command: cmd, TerminateDuration: o.CloseGrace}
 	cctx, cancel := context.WithTimeout(ctx, o.ConnectTimeout)
 	defer cancel()
@@ -139,11 +157,15 @@ func (h headerRoundTripper) RoundTrip(req *http.Request) (*http.Response, error)
 // here (ConnectTimeout); an accepted-but-never-initializing endpoint
 // fails construction within the bound. The caller's httpClient is never
 // mutated (cloned before wrapping).
-func DialHTTP(ctx context.Context, endpoint string, headers map[string]string, httpClient *http.Client, opts Options) (Session, error) {
+func DialHTTP(ctx context.Context, endpoint string, headers map[string]string, httpClient *http.Client, opts Options, onListChanged ...func(context.Context, *mcp.ToolListChangedRequest)) (Session, error) {
 	if endpoint == "" {
 		return nil, fmt.Errorf("proxy: HTTP endpoint required")
 	}
 	o, err := opts.resolve()
+	if err != nil {
+		return nil, err
+	}
+	copts, err := clientOpts(onListChanged)
 	if err != nil {
 		return nil, err
 	}
@@ -165,7 +187,7 @@ func DialHTTP(ctx context.Context, endpoint string, headers map[string]string, h
 		MaxRetries:           -1,
 		DisableStandaloneSSE: true,
 	}
-	client := mcp.NewClient(&mcp.Implementation{Name: "proxy", Version: "0.0.1"}, nil)
+	client := mcp.NewClient(&mcp.Implementation{Name: "proxy", Version: "0.0.1"}, copts)
 	cctx, cancel := context.WithTimeout(ctx, o.ConnectTimeout)
 	defer cancel()
 	// v1.7 wrinkle (locked): against a fully-silent endpoint the SDK's

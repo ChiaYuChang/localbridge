@@ -52,29 +52,42 @@ type Git struct {
 	root    string
 	bin     string
 	timeout time.Duration
+	env     []string
 }
 
-// NewGit validates an absolute cleaned root and resolves the git binary
-// once; it performs NO repo-ness check (workspace may not be a repo;
+// NewGit validates an absolute cleaned root, resolves the git binary
+// once, and REQUIRES an explicit child env (nil/empty is a construction
+// error, never ambient fallback — `cmd.Env == nil` would inherit the
+// parent env); the slice is COPIED (caller post-mutation cannot affect
+// children). It performs NO repo-ness check (workspace may not be a repo;
 // per-call mapping keeps filesystem-only use serving).
-func NewGit(root string) (*Git, error) {
+func NewGit(root string, env []string) (*Git, error) {
 	bin, err := exec.LookPath("git")
 	if err != nil {
 		return nil, fmt.Errorf("git binary %q: %w", "git", err)
 	}
-	return newGitWithBin(root, bin, GitDefaultTimeout)
+	return newGitWithBin(root, bin, GitDefaultTimeout, env)
 }
 
-// newGitWithBin is the test seam: explicit binary, timeout and root with
-// the same validation as NewGit.
-func newGitWithBin(root, bin string, timeout time.Duration) (*Git, error) {
+// newGitWithBin is the test seam: explicit binary, timeout, root and env
+// with the same validation as NewGit.
+func newGitWithBin(root, bin string, timeout time.Duration, env []string) (*Git, error) {
 	if _, err := exec.LookPath(bin); err != nil {
 		return nil, fmt.Errorf("git binary %q: %w", bin, err)
 	}
 	if root == "" || !filepath.IsAbs(root) || filepath.Clean(root) != root {
 		return nil, fmt.Errorf("git root %q must be absolute and clean", root)
 	}
-	return &Git{root: root, bin: bin, timeout: timeout}, nil
+	if len(env) == 0 {
+		return nil, fmt.Errorf("git env required (explicit, never ambient)")
+	}
+	return &Git{root: root, bin: bin, timeout: timeout, env: append([]string(nil), env...)}, nil
+}
+
+// Environ returns a copy of the stored child env (inspection seam for
+// copy/absence proofs; exec uses the stored slice, never ambient).
+func (g *Git) Environ() []string {
+	return append([]string(nil), g.env...)
 }
 
 // ResolveRoot absolutizes+cleans a GIT_ROOT value (default: workspace
@@ -167,6 +180,7 @@ func (g *Git) runGit(ctx context.Context, argv ...string) (string, error) {
 	full := append([]string{"--no-pager"}, argv...)
 	cmd := exec.CommandContext(ctx, g.bin, full...)
 	cmd.Dir = g.root
+	cmd.Env = g.env
 	cmd.Stdout = stdout
 	cmd.Stderr = stderr
 	runErr := cmd.Run()
@@ -194,15 +208,22 @@ func (g *Git) runGit(ctx context.Context, argv ...string) (string, error) {
 	return string(out), nil
 }
 
-// RegisterGitTools registers the four git tools sharing the single
-// startup Hider (mirrors filesystem.RegisterAllTools).
-func RegisterGitTools(srv *mcp.Server, git *Git, h *secrets.SecretHider) error {
-	all := []tools.Tool{
+// NativeTools returns the four git tools sharing one Hider (same list
+// RegisterGitTools registers; single source of truth for the G4 native
+// registry path).
+func NativeTools(git *Git, h *secrets.SecretHider) []tools.Tool {
+	return []tools.Tool{
 		ToolGitStatus{git: git},
 		ToolGitDiff{git: git, h: h},
 		ToolGitLog{git: git, h: h},
 		ToolGitShow{git: git, h: h},
 	}
+}
+
+// RegisterGitTools registers the four git tools sharing the single
+// startup Hider (mirrors filesystem.RegisterAllTools).
+func RegisterGitTools(srv *mcp.Server, git *Git, h *secrets.SecretHider) error {
+	all := NativeTools(git, h)
 	for _, t := range all {
 		if err := t.Register(srv); err != nil {
 			return err

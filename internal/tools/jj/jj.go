@@ -62,30 +62,43 @@ type JJ struct {
 	root    string
 	bin     string
 	timeout time.Duration
+	env     []string
 }
 
-// NewJJ validates an absolute cleaned root and resolves the jj binary
-// once; it performs NO repo-ness check (workspace may not be a repo;
+// NewJJ validates an absolute cleaned root, resolves the jj binary once,
+// and REQUIRES an explicit child env (nil/empty is a construction error,
+// never ambient fallback — `cmd.Env == nil` would inherit the parent
+// env); the slice is COPIED (caller post-mutation cannot affect
+// children). It performs NO repo-ness check (workspace may not be a repo;
 // per-call mapping keeps filesystem-only use serving). A missing binary
 // is a construction error; run() propagates it and refuses startup.
-func NewJJ(root string) (*JJ, error) {
+func NewJJ(root string, env []string) (*JJ, error) {
 	bin, err := exec.LookPath("jj")
 	if err != nil {
 		return nil, fmt.Errorf("jj binary %q: %w", "jj", err)
 	}
-	return newJJWithBin(root, bin, JJDefaultTimeout)
+	return newJJWithBin(root, bin, JJDefaultTimeout, env)
 }
 
-// newJJWithBin is the test seam: explicit binary, timeout and root with
-// the same validation as NewJJ.
-func newJJWithBin(root, bin string, timeout time.Duration) (*JJ, error) {
+// newJJWithBin is the test seam: explicit binary, timeout, root and env
+// with the same validation as NewJJ.
+func newJJWithBin(root, bin string, timeout time.Duration, env []string) (*JJ, error) {
 	if _, err := exec.LookPath(bin); err != nil {
 		return nil, fmt.Errorf("jj binary %q: %w", bin, err)
 	}
 	if root == "" || !filepath.IsAbs(root) || filepath.Clean(root) != root {
 		return nil, fmt.Errorf("jj root %q must be absolute and clean", root)
 	}
-	return &JJ{root: root, bin: bin, timeout: timeout}, nil
+	if len(env) == 0 {
+		return nil, fmt.Errorf("jj env required (explicit, never ambient)")
+	}
+	return &JJ{root: root, bin: bin, timeout: timeout, env: append([]string(nil), env...)}, nil
+}
+
+// Environ returns a copy of the stored child env (inspection seam for
+// copy/absence proofs; exec uses the stored slice, never ambient).
+func (j *JJ) Environ() []string {
+	return append([]string(nil), j.env...)
 }
 
 // ResolveRoot absolutizes+cleans a JJ_ROOT value (default: workspace
@@ -183,6 +196,7 @@ func (j *JJ) runJJ(ctx context.Context, argv ...string) (string, error) {
 	full := append([]string{"--no-pager", "--color=never", "--ignore-working-copy", "-R", j.root}, argv...)
 	cmd := exec.CommandContext(ctx, j.bin, full...)
 	cmd.Dir = j.root
+	cmd.Env = j.env
 	cmd.Stdout = stdout
 	cmd.Stderr = stderr
 	runErr := cmd.Run()
@@ -210,16 +224,23 @@ func (j *JJ) runJJ(ctx context.Context, argv ...string) (string, error) {
 	return string(out), nil
 }
 
-// RegisterJJTools registers the four jj tools sharing the single
-// startup Hider (mirrors filesystem.RegisterAllTools; status takes no
-// Hider — paths are unmasked metadata, denied pruned silently).
-func RegisterJJTools(srv *mcp.Server, jj *JJ, h *secrets.SecretHider) error {
-	all := []tools.Tool{
+// NativeTools returns the four jj tools sharing one Hider (same list
+// RegisterJJTools registers; single source of truth for the G4 native
+// registry path).
+func NativeTools(jj *JJ, h *secrets.SecretHider) []tools.Tool {
+	return []tools.Tool{
 		ToolJJStatus{jj: jj},
 		ToolJJDiff{jj: jj, h: h},
 		ToolJJLog{jj: jj, h: h},
 		ToolJJShow{jj: jj, h: h},
 	}
+}
+
+// RegisterJJTools registers the four jj tools sharing the single
+// startup Hider (mirrors filesystem.RegisterAllTools; status takes no
+// Hider — paths are unmasked metadata, denied pruned silently).
+func RegisterJJTools(srv *mcp.Server, jj *JJ, h *secrets.SecretHider) error {
+	all := NativeTools(jj, h)
 	for _, t := range all {
 		if err := t.Register(srv); err != nil {
 			return err

@@ -55,7 +55,7 @@ func openFake(t *testing.T, timeout time.Duration) (*JJ, string) {
 	}
 	t.Setenv("JJ_FIXTURE_LOG", logPath)
 	t.Setenv("JJ_FIXTURE_ROOT", root)
-	j, err := newJJWithBin(root, bin, timeout)
+	j, err := newJJWithBin(root, bin, timeout, os.Environ())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -105,25 +105,61 @@ func requireGlobalPrefix(t *testing.T, rec []string, root string) []string {
 
 func TestNewJJ_Validation(t *testing.T) {
 	bin := fixtureBin(t)
-	if _, err := newJJWithBin("", bin, time.Second); err == nil {
+	if _, err := newJJWithBin("", bin, time.Second, os.Environ()); err == nil {
 		t.Fatalf("want empty-root error")
 	}
-	if _, err := newJJWithBin("relative/path", bin, time.Second); err == nil {
+	if _, err := newJJWithBin("relative/path", bin, time.Second, os.Environ()); err == nil {
 		t.Fatalf("want relative-root error")
 	}
-	if _, err := newJJWithBin("/tmp//dirty", bin, time.Second); err == nil {
+	if _, err := newJJWithBin("/tmp//dirty", bin, time.Second, os.Environ()); err == nil {
 		t.Fatalf("want dirty-root error")
 	}
-	if _, err := newJJWithBin(t.TempDir(), bin, time.Second); err != nil {
+	if _, err := newJJWithBin(t.TempDir(), bin, time.Second, os.Environ()); err != nil {
 		t.Fatalf("abs clean root err: %v", err)
 	}
 }
 
 func TestNewJJ_MissingBinary(t *testing.T) {
-	if _, err := newJJWithBin(t.TempDir(), "/nonexistent-jj-binary-xyz", time.Second); err == nil {
+	if _, err := newJJWithBin(t.TempDir(), "/nonexistent-jj-binary-xyz", time.Second, os.Environ()); err == nil {
 		t.Fatalf("want missing-binary error")
 	} else if !strings.Contains(err.Error(), "/nonexistent-jj-binary-xyz") {
 		t.Fatalf("error must name binary, got %v", err)
+	}
+}
+
+func TestNewJJ_EnvRequired(t *testing.T) {
+	dir := t.TempDir()
+	if _, err := NewJJ(dir, nil); err == nil {
+		t.Fatalf("nil env must fail construction")
+	}
+	if _, err := NewJJ(dir, []string{}); err == nil {
+		t.Fatalf("empty env must fail construction")
+	}
+}
+
+func TestNewJJ_EnvCopiedAndExplicit(t *testing.T) {
+	// Copy semantics: caller post-mutation cannot affect children.
+	// Absence: planted secrets never enter the stored env.
+	t.Setenv("CONTROL_PLANE_API_KEY", "planted")
+	env := []string{"A=1", "CONTROL_PLANE_API_KEY=explicit"}
+	j, err := newJJWithBin(t.TempDir(), fixtureBin(t), time.Second, env)
+	if err != nil {
+		t.Fatal(err)
+	}
+	env[0] = "A=MUT"
+	env[1] = "CONTROL_PLANE_API_KEY=MUT"
+	got := j.Environ()
+	if len(got) != 2 || got[0] != "A=1" || got[1] != "CONTROL_PLANE_API_KEY=explicit" {
+		t.Fatalf("stored env must be a copy: %q", got)
+	}
+	j2, err := newJJWithBin(t.TempDir(), fixtureBin(t), time.Second, []string{"A=1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, kv := range j2.Environ() {
+		if strings.HasPrefix(kv, "CONTROL_PLANE_API_KEY=") {
+			t.Fatalf("ambient secret inherited: %q", kv)
+		}
 	}
 }
 
@@ -369,7 +405,7 @@ func TestLog_Modes(t *testing.T) {
 			t.Fatal(err)
 		}
 		t.Setenv("JJ_FIXTURE_LOG", logPath)
-		j, err := newJJWithBin(root, bin, 5*time.Second)
+		j, err := newJJWithBin(root, bin, 5*time.Second, os.Environ())
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -458,8 +494,12 @@ func TestEchoInput(t *testing.T) {
 		t.Fatalf("log rev echo missing: %v", err)
 	}
 	// Log child failure echoes effective rev (owned default verbatim).
+	// Fresh construction AFTER the mode switch: child env is fixed at
+	// construction (never ambient), so the fixture switch must precede it.
 	t.Setenv("JJ_FIXTURE_MODE", "notarepo")
-	if _, _, err := logTool.handle(ctx, nil, ToolJJLogI{}); !errors.Is(err, ErrNotAJJRepo) {
+	jn, _ := openFake(t, 5*time.Second)
+	logToolN := ToolJJLog{jj: jn, h: h}
+	if _, _, err := logToolN.handle(ctx, nil, ToolJJLogI{}); !errors.Is(err, ErrNotAJJRepo) {
 		t.Fatalf("want ErrNotAJJRepo, got %v", err)
 	} else if !strings.Contains(err.Error(), `"::@"`) {
 		t.Fatalf("default-rev echo missing: %v", err)
@@ -580,11 +620,18 @@ func TestJJ_Transport(t *testing.T) {
 	}
 
 	t.Setenv("JJ_FIXTURE_MODE", "overcap")
+	// Fresh construction AFTER the mode switch (child env fixed at
+	// construction): new server on the overcap fixture.
+	j2, _ := openFake(t, 5*time.Second)
+	srv2 := mcp.NewServer(&mcp.Implementation{Name: "test", Version: "0.0.1"}, nil)
+	if err := RegisterJJTools(srv2, j2, h); err != nil {
+		t.Fatal(err)
+	}
 	serverTransport, clientTransport := mcp.NewInMemoryTransports()
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	serverDone := make(chan error, 1)
-	go func() { serverDone <- srv.Run(ctx, serverTransport) }()
+	go func() { serverDone <- srv2.Run(ctx, serverTransport) }()
 	cli := mcp.NewClient(&mcp.Implementation{Name: "cli", Version: "0.0.1"}, nil)
 	cs, err := cli.Connect(ctx, clientTransport, nil)
 	if err != nil {
@@ -673,7 +720,7 @@ func TestSmoke_RealBinary(t *testing.T) {
 	// Plain status snapshots (tool argv never snapshots by construction).
 	jjRun(t, dir, "status")
 
-	j, err := NewJJ(dir)
+	j, err := NewJJ(dir, os.Environ())
 	if err != nil {
 		t.Fatal(err)
 	}

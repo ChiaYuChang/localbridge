@@ -58,10 +58,11 @@ func LoadHider(fs *FileSystem) (*secrets.SecretHider, error) {
 	}
 }
 
-// RegisterAllTools registers the eight filesystem tools: content tools
-// share the single startup SecretHider, metadata tools take fs only.
-func RegisterAllTools(srv *mcp.Server, fs *FileSystem, h *secrets.SecretHider) error {
-	all := []tools.Tool{
+// NativeTools returns the eight filesystem tools sharing one Hider
+// (same list AND order RegisterAllTools registers; single source of
+// truth for the G4 native registry path).
+func NativeTools(fs *FileSystem, h *secrets.SecretHider) []tools.Tool {
+	return []tools.Tool{
 		ToolReadFile{fs: fs, h: h},
 		ToolReadMultipleFiles{fs: fs, h: h},
 		ToolSearchFiles{fs: fs, h: h},
@@ -71,6 +72,12 @@ func RegisterAllTools(srv *mcp.Server, fs *FileSystem, h *secrets.SecretHider) e
 		ToolGetFileInfo{fs: fs},
 		ToolListAllowedDirectories{},
 	}
+}
+
+// RegisterAllTools registers the eight filesystem tools: content tools
+// share the single startup SecretHider, metadata tools take fs only.
+func RegisterAllTools(srv *mcp.Server, fs *FileSystem, h *secrets.SecretHider) error {
+	all := NativeTools(fs, h)
 	for _, t := range all {
 		if err := t.Register(srv); err != nil {
 			return err

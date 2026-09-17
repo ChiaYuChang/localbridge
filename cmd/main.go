@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"flag"
 	"fmt"
 	"log"
 	"os"
@@ -15,7 +16,8 @@ import (
 
 	tunnelclient "github.com/openai/tunnel-client"
 
-	"github.com/ChiaYuChang/local-mcp/internal/tools/filesystem"
+	"github.com/ChiaYuChang/local-mcp/internal/config"
+	"github.com/ChiaYuChang/local-mcp/internal/gateway"
 	"github.com/ChiaYuChang/local-mcp/internal/tools/git"
 	"github.com/ChiaYuChang/local-mcp/internal/tools/jj"
 )
@@ -23,86 +25,93 @@ import (
 const readyFileEnv = "TUNNEL_CLIENT_SDK_READY_FILE"
 
 func main() {
+	configPath := flag.String("config", "", "gateway config file path ('-' reads stdin; empty serves natives only)")
+	var profiles profileFlags
+	flag.Var(&profiles, "profile", "active profile (repeatable)")
+	flag.Parse()
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
-	if err := run(ctx); err != nil {
+	if err := run(ctx, *configPath, profiles); err != nil {
 		log.Fatal(err)
 	}
 }
 
-func run(ctx context.Context) error {
-	server := mcp.NewServer(&mcp.Implementation{
-		Name:    "tunnel-client-sdk-example",
-		Version: "1.0.0",
-	}, nil)
-	mcp.AddTool(server, &mcp.Tool{
-		Name:        "echo",
-		Description: "Return the caller's message through the OpenAI Tunnel control plane.",
-	}, func(_ context.Context, _ *mcp.CallToolRequest, args map[string]any) (*mcp.CallToolResult, map[string]string, error) {
-		message := fmt.Sprintf("Echo: %s", args["message"])
-		return &mcp.CallToolResult{
-			Content: []mcp.Content{&mcp.TextContent{Text: message}},
-		}, map[string]string{"message": message}, nil
-	})
+type profileFlags []string
+
+func (p *profileFlags) String() string { return strings.Join(*p, ",") }
+
+func (p *profileFlags) Set(v string) error {
+	*p = append(*p, v)
+	return nil
+}
+
+func run(ctx context.Context, configPath string, profiles []string) error {
+	// Bootstrap: config-source acquisition (file/stdin/empty) with
+	// origin labels; tunnel credential validation lives ONLY here.
+	var (
+		configData   []byte
+		configOrigin string
+	)
+	switch configPath {
+	case "":
+		configOrigin = "default(empty)"
+	case "-":
+		var err error
+		configData, configOrigin, err = gateway.LoadSource("-", os.Stdin)
+		if err != nil {
+			return err
+		}
+	default:
+		var err error
+		configData, configOrigin, err = gateway.LoadSource(configPath, nil)
+		if err != nil {
+			return err
+		}
+	}
 
 	workspaceRoot := os.Getenv("WORKSPACE_ROOT")
 	if workspaceRoot == "" {
 		workspaceRoot = "."
 	}
-	fs, err := filesystem.New(workspaceRoot)
-	if err != nil {
-		return err
-	}
-	defer fs.Close()
-	h, err := filesystem.LoadHider(fs)
-	if err != nil {
-		return err
-	}
-	if err := filesystem.RegisterAllTools(server, fs, h); err != nil {
-		return err
-	}
-
 	gitRoot, err := git.ResolveRoot(os.Getenv("GIT_ROOT"), workspaceRoot)
 	if err != nil {
 		return err
 	}
-	g, err := git.NewGit(gitRoot)
-	if err != nil {
-		return err
-	}
-	if err := git.RegisterGitTools(server, g, h); err != nil {
-		return err
-	}
-
 	jjRoot, err := jj.ResolveRoot(os.Getenv("JJ_ROOT"), workspaceRoot)
 	if err != nil {
 		return err
 	}
-	j, err := jj.NewJJ(jjRoot)
+
+	// Caller-created transports (ownership: core serves, never closes).
+	serverTransport, clientTransport := mcp.NewInMemoryTransports()
+	gw, err := gateway.Compose(ctx, gateway.Options{
+		WorkspaceRoot:  workspaceRoot,
+		GitRoot:        gitRoot,
+		JJRoot:         jjRoot,
+		ConfigData:     configData,
+		ConfigOrigin:   configOrigin,
+		Profiles:       profiles,
+		ServeTransport: serverTransport,
+		NativeEnv:      config.BuildEnv(os.Environ(), nil),
+	})
 	if err != nil {
 		return err
 	}
-	if err := jj.RegisterJJTools(server, j, h); err != nil {
-		return err
-	}
-
-	serverTransport, clientTransport := mcp.NewInMemoryTransports()
-	serverCtx, stopServer := context.WithCancel(ctx)
-	defer stopServer()
-	serverDone := make(chan error, 1)
-	go func() {
-		serverDone <- server.Run(serverCtx, serverTransport)
-	}()
+	serveDone := make(chan error, 1)
+	go func() { serveDone <- gw.Serve(ctx) }()
 
 	cfg, err := configFromEnvironment()
 	if err != nil {
+		_ = gw.Close()
 		return err
 	}
 	client, err := tunnelclient.New(cfg, clientTransport)
 	if err != nil {
+		_ = gw.Close()
 		return err
 	}
 	if err := client.Start(ctx); err != nil {
+		_ = gw.Close()
 		return err
 	}
 	defer func() {
@@ -112,19 +121,23 @@ func run(ctx context.Context) error {
 	}()
 
 	if err := client.WaitUntilReady(ctx); err != nil {
+		_ = gw.Close()
 		return fmt.Errorf("wait for tunnel control plane: %w", err)
 	}
 	if err := writeReadyFile(os.Getenv(readyFileEnv)); err != nil {
+		_ = gw.Close()
 		return err
 	}
 	fmt.Fprintln(os.Stderr, "tunnel-client SDK example connected")
 
 	select {
 	case <-ctx.Done():
+		_ = gw.Close()
 		return nil
 	case <-client.Done():
+		_ = gw.Close()
 		return errors.New("tunnel-client SDK runtime stopped")
-	case err := <-serverDone:
+	case err := <-serveDone:
 		if err == nil || errors.Is(err, context.Canceled) {
 			return nil
 		}

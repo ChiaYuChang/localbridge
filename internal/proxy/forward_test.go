@@ -729,7 +729,12 @@ func TestForwardScope(t *testing.T) {
 			}
 			code.WriteString(line + "\n")
 		}
-		for _, banned := range []string{"gtest", "reconnect", "rediscover", "re-discover", "list_changed", "ListChanged", "istChanged"} {
+		// NOTE: ListChanged *identifiers* are allowed (G2 optional
+		// downstream handler plumbing, P4 reachable-but-wired-off);
+		// what stays forbidden is the wire emission path
+		// (list_changed notification) plus test endpoints and
+		// reconnect logic.
+		for _, banned := range []string{"gtest", "reconnect", "rediscover", "re-discover", "list_changed"} {
 			if strings.Contains(code.String(), banned) {
 				t.Errorf("%s: banned %q in production code", n, banned)
 			}

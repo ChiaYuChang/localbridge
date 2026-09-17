@@ -23,6 +23,7 @@
 - **Living Memory Single-Writer**: Planner sole author/curator of `AGENTS.md`. Others never edit directly.
 - **Language Standard & Telegraphic Style**: Concise en-US ASCII. Drop articles/filler/prose. Non-ASCII requires adjacent inline rationale. Exact symbols/paths mandatory.
 - **Inter-Agent Messaging**: Efficiency-first. Compact structured payloads, exact symbols/paths, no pleasantries.
+- **Gateway Joint Flow**: For gateway scope strictly follow contact-online > write plan > online-consensus > Reviewer-gate > jointly-defend-with-online > on PASS await operator instruction before Builder. Never skip consensus; never build pre-gate.
 - **Commit & Publication Separation**: Commit auth = local seal only. Remote push requires separate explicit user auth.
 - **Fail-Closed Intent Recovery**: On `AUTHORIZATION_DENIED`, return to Step 2 await renewed intent. No autonomous re-draft.
 - **Conventional Commits**: `feat`, `fix`, `refactor`, `test`, `docs`, `chore`. Concise header, no plan slug.
@@ -63,9 +64,9 @@
 
 ## Active State & In-Flight Context
 
-- **Observed-At**: `2026-09-17T22:51:03Z - G2+G3 proxy sealed (feat(proxy) @ ozxrktkx)`
-- **Dirty Status**: `dirty (C1 container + path-deletion + AGENTS.md unsealed; first-green repo-wide)`
-- **Milestone**: `C1 + PATH-STUB REVIEW_PASS - docker build green, 12/12 proof PASS, 180 tests zero-overlay`
-- **Next Pickup Item**: `Commit C1+path-deletion per seal cadence, or draft G4 native-startup sub-plan pair`
+- **Observed-At**: `2026-09-18T03:38:13Z - C1+path-deletion sealed (feat(container) @ vxswwykn)`
+- **Dirty Status**: `dirty (G4 gateway + AGENTS.md unsealed; SCAN_CLEAN; barrier pending)`
+- **Milestone**: `GATEWAY WIP - BLUEPRINT_PASS (reaffirmed); G1-G4 SUBPLAN_REVIEW_PASS; G5 tunnel E2E pending creds; commit flow Step 6`
+- **Next Pickup Item**: `Reviewer barrier verdict, then present message for seal auth`
 - **Commit Ordering Rule**: All `AGENTS.md` content updates land PRE-seal. `Observed-At` carries timestamp + sealed message only, never commit hashes (hashes mutate on squash and live authoritatively in `jj log`); no post-seal squash cycle exists.
 - **Ground Truth Revalidation Invariant**: Cold-start Planners MUST run fresh VCS status/log inspection; never trust cached Active State.

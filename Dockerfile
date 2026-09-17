@@ -8,6 +8,29 @@ RUN go mod download
 COPY . .
 RUN go build -o /out/gateway ./cmd/
 
+# Test stage (explicit chain: builder -> test -> runtime). Installs the
+# SAME pinned jj 0.41.0 tarball by SHA + distro git, then runs the
+# gateway composition suite at build time (real git/jj integration
+# in-container: composition, natives, integration, sanitized child env,
+# proxy child start/stop). Build-stage tests prove composition ONLY —
+# never mount/PID1/stop semantics (those belong to container-proof.sh
+# runtime rows; never credited across).
+FROM build AS test
+RUN apt-get update && apt-get install -y --no-install-recommends git curl ca-certificates && rm -rf /var/lib/apt/lists/*
+ARG TARGETARCH
+RUN set -eu; \
+  case "${TARGETARCH:-amd64}" in \
+    amd64) JJ_TRIPLE=x86_64-unknown-linux-musl; JJ_SHA=42181a80d316ac157874c817c9945e104275114fb461d99e06e2312502f08f99 ;; \
+    arm64) JJ_TRIPLE=aarch64-unknown-linux-musl; JJ_SHA=cd75d0f920b2674147a48eac84ee4594f476fc8f98cd7e358b25750a51622d91 ;; \
+    *) echo "unsupported arch ${TARGETARCH}"; exit 1 ;; \
+  esac; \
+  curl -fsSL -o /tmp/jj.tar.gz "https://github.com/jj-vcs/jj/releases/download/v0.41.0/jj-v0.41.0-${JJ_TRIPLE}.tar.gz"; \
+  echo "${JJ_SHA}  /tmp/jj.tar.gz" | sha256sum -c -; \
+  tar -xzf /tmp/jj.tar.gz -C /usr/local/bin --strip-components=1 --wildcards '*/jj'; \
+  chmod 755 /usr/local/bin/jj; \
+  rm /tmp/jj.tar.gz
+RUN go test ./internal/gateway/ -count=1
+
 # Runtime: node LTS slim (Debian trixie).
 FROM node:lts-trixie-slim
 # One apt layer: git (VCS tooling) + tini (PID 1) + pipx (classic

@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"runtime"
 	"slices"
 	"sort"
@@ -180,7 +181,12 @@ func callText(t *testing.T, s Session, name string, args map[string]any) string 
 // ---- lifecycle ----
 
 func TestStdioLifecycle(t *testing.T) {
-	s := dialStdioFake(t, "normal", nil, testOpts())
+	// Test-only grace above the production default: the race-built fake
+	// child can need longer than 1s to exit on stdin EOF under parallel
+	// load (production default untouched).
+	opts := testOpts()
+	opts.CloseGrace = 5 * time.Second
+	s := dialStdioFake(t, "normal", nil, opts)
 	tools, err := s.Tools(context.Background())
 	if err != nil {
 		t.Fatal(err)
@@ -193,8 +199,31 @@ func TestStdioLifecycle(t *testing.T) {
 	if got := callText(t, s, "echo", map[string]any{"msg": "hi"}); !strings.Contains(got, "hi") {
 		t.Fatalf("echo=%q", got)
 	}
-	if err := s.Close(); err != nil {
-		t.Fatalf("close: %v", err)
+	// Bounded close with force-path tolerance: on a loaded machine the
+	// child may outlive the grace and take SIGTERM (ExitError). Either
+	// outcome is accepted iff the child is reaped (no zombie) — the
+	// force path itself is pinned by TestCloseGraceForce.
+	start := time.Now()
+	cerr := s.Close()
+	if el := time.Since(start); el > 15*time.Second {
+		t.Fatalf("close unbounded: %v", el)
+	}
+	if cerr != nil {
+		var exitErr *exec.ExitError
+		if !errors.As(cerr, &exitErr) {
+			t.Fatalf("close: unexpected error type: %v", cerr)
+		}
+	}
+	inner, ok := s.(*session)
+	if !ok {
+		t.Fatalf("fake must return *session")
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for inner.cmd.ProcessState == nil {
+		if time.Now().After(deadline) {
+			t.Fatalf("child never reaped after close")
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 	if err := s.Close(); err != nil {
 		t.Fatalf("reclose must be idempotent nil: %v", err)
@@ -934,6 +963,29 @@ func TestMapErrRefused(t *testing.T) {
 	s.mu.Unlock()
 	if err := s.mapErr(pctx, ctx, refused); !errors.Is(err, ErrSessionClosed) {
 		t.Fatalf("closed must beat refused, got %v", err)
+	}
+}
+
+func TestClientOpts(t *testing.T) {
+	// Nil/empty ins produce nil opts (exact current behavior preserved).
+	if got, err := clientOpts(nil); err != nil || got != nil {
+		t.Fatalf("nil: %v %v", got, err)
+	}
+	if got, err := clientOpts([]func(context.Context, *mcp.ToolListChangedRequest){}); err != nil || got != nil {
+		t.Fatalf("empty: %v %v", got, err)
+	}
+	var nilHandler func(context.Context, *mcp.ToolListChangedRequest)
+	if got, err := clientOpts([]func(context.Context, *mcp.ToolListChangedRequest){nilHandler}); err != nil || got != nil {
+		t.Fatalf("nil handler: %v %v", got, err)
+	}
+	// At most one handler.
+	h := func(context.Context, *mcp.ToolListChangedRequest) {}
+	if _, err := clientOpts([]func(context.Context, *mcp.ToolListChangedRequest){h, h}); err == nil {
+		t.Fatalf("two handlers must fail")
+	}
+	// One handler threads through.
+	if got, err := clientOpts([]func(context.Context, *mcp.ToolListChangedRequest){h}); err != nil || got == nil {
+		t.Fatalf("one handler: %v %v", got, err)
 	}
 }
 

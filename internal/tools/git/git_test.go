@@ -80,7 +80,9 @@ func testHider(t *testing.T) *secrets.SecretHider {
 
 func openGit(t *testing.T, dir string) *Git {
 	t.Helper()
-	g, err := NewGit(dir)
+	// Mechanical migration: explicit ambient env (asserts untouched;
+	// production passes G1-built env; absence/copy pinned separately).
+	g, err := NewGit(dir, os.Environ())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -93,26 +95,62 @@ func intPtr(n int) *int { return &n }
 
 func TestNewGit_Validation(t *testing.T) {
 	requireGit(t)
-	if _, err := NewGit(""); err == nil {
+	if _, err := NewGit("", os.Environ()); err == nil {
 		t.Fatalf("want empty-root error")
 	}
-	if _, err := NewGit("relative/path"); err == nil {
+	if _, err := NewGit("relative/path", os.Environ()); err == nil {
 		t.Fatalf("want relative-root error")
 	}
-	if _, err := NewGit("/tmp//dirty"); err == nil {
+	if _, err := NewGit("/tmp//dirty", os.Environ()); err == nil {
 		t.Fatalf("want dirty-root error")
 	}
 	dir := t.TempDir()
-	if _, err := NewGit(dir); err != nil {
+	if _, err := NewGit(dir, os.Environ()); err != nil {
 		t.Fatalf("abs clean root err: %v", err)
 	}
 }
 
 func TestNewGit_MissingBinary(t *testing.T) {
-	if _, err := newGitWithBin(t.TempDir(), "/nonexistent-git-binary-xyz", time.Second); err == nil {
+	if _, err := newGitWithBin(t.TempDir(), "/nonexistent-git-binary-xyz", time.Second, os.Environ()); err == nil {
 		t.Fatalf("want missing-binary error")
 	} else if !strings.Contains(err.Error(), "/nonexistent-git-binary-xyz") {
 		t.Fatalf("error must name binary, got %v", err)
+	}
+}
+
+func TestNewGit_EnvRequired(t *testing.T) {
+	dir := t.TempDir()
+	if _, err := NewGit(dir, nil); err == nil {
+		t.Fatalf("nil env must fail construction")
+	}
+	if _, err := NewGit(dir, []string{}); err == nil {
+		t.Fatalf("empty env must fail construction")
+	}
+}
+
+func TestNewGit_EnvCopiedAndExplicit(t *testing.T) {
+	// Copy semantics: caller post-mutation cannot affect children.
+	// Absence: planted secrets never enter the stored env.
+	t.Setenv("CONTROL_PLANE_API_KEY", "planted")
+	env := []string{"A=1", "CONTROL_PLANE_API_KEY=explicit"}
+	g, err := newGitWithBin(t.TempDir(), "git", time.Second, env)
+	if err != nil {
+		t.Fatal(err)
+	}
+	env[0] = "A=MUT"
+	env[1] = "CONTROL_PLANE_API_KEY=MUT"
+	got := g.Environ()
+	if len(got) != 2 || got[0] != "A=1" || got[1] != "CONTROL_PLANE_API_KEY=explicit" {
+		t.Fatalf("stored env must be a copy: %q", got)
+	}
+	g2, err := newGitWithBin(t.TempDir(), "git", time.Second, []string{"A=1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, kv := range g2.Environ() {
+		if strings.HasPrefix(kv, "CONTROL_PLANE_API_KEY=") {
+			t.Fatalf("ambient secret inherited: %q", kv)
+		}
 	}
 }
 
@@ -169,7 +207,7 @@ func TestRunGit_Timeout(t *testing.T) {
 	if err := os.WriteFile(stub, []byte("#!/bin/sh\nexec sleep 5\n"), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	g, err := newGitWithBin(dir, stub, 50*time.Millisecond)
+	g, err := newGitWithBin(dir, stub, 50*time.Millisecond, os.Environ())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -329,7 +367,7 @@ func TestGitDiff_InvalidRev(t *testing.T) {
 	dir := initRepo(t)
 	argvFile := filepath.Join(t.TempDir(), "argv")
 	stub := stubBin(t, argvFile)
-	g, err := newGitWithBin(dir, stub, 30*time.Second)
+	g, err := newGitWithBin(dir, stub, 30*time.Second, os.Environ())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -500,7 +538,7 @@ func TestArgvCapture(t *testing.T) {
 	commitShape(t, dir, "f.txt", "v1\n", "one")
 	commitShape(t, dir, "g.txt", "g1\n", "two")
 	argvFile := filepath.Join(t.TempDir(), "argv")
-	stub, err := newGitWithBin(dir, stubBin(t, argvFile), 30*time.Second)
+	stub, err := newGitWithBin(dir, stubBin(t, argvFile), 30*time.Second, os.Environ())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -628,7 +666,7 @@ func TestGit_Transport(t *testing.T) {
 	}
 
 	big := bigChangeRepo(t)
-	bg, err := NewGit(big)
+	bg, err := NewGit(big, os.Environ())
 	if err != nil {
 		t.Fatal(err)
 	}
