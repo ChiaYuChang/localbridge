@@ -63,9 +63,9 @@
 
 ## Active State & In-Flight Context
 
-- **Observed-At**: `2026-09-17T20:04:49Z - feat(config): declarative server config with profiles (sealed)`
-- **Dirty Status**: `dirty (AGENTS.md ordering-rule + Observed-At format change only)`
-- **Milestone**: `COMMIT_SEALED - feat(config); local only, no push`
-- **Next Pickup Item**: `Draft G2 transport/session sub-plan pair on operator go`
+- **Observed-At**: `2026-09-17T22:51:03Z - G2+G3 proxy sealed (feat(proxy) @ ozxrktkx)`
+- **Dirty Status**: `dirty (AGENTS.md seal-state update only; sealed change clean)`
+- **Milestone**: `COMMIT_SEALED - feat(proxy): transport sessions and forwarding core; local only, no push`
+- **Next Pickup Item**: `Draft G4 native-startup sub-plan pair on operator go`
 - **Commit Ordering Rule**: All `AGENTS.md` content updates land PRE-seal. `Observed-At` carries timestamp + sealed message only, never commit hashes (hashes mutate on squash and live authoritatively in `jj log`); no post-seal squash cycle exists.
 - **Ground Truth Revalidation Invariant**: Cold-start Planners MUST run fresh VCS status/log inspection; never trust cached Active State.
