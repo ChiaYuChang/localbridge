@@ -1,0 +1,9 @@
+.git
+.jj
+.secrets
+.devenv/
+devenv.yaml
+devenv.nix
+devenv.lock
+.direnv/
+scripts/
