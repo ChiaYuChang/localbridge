@@ -6,7 +6,7 @@ WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
-RUN go build -o /out/gateway ./cmd/
+RUN go build -o /out/localbridge ./cmd/
 
 # Test stage (explicit chain: builder -> test -> runtime). Installs the
 # SAME pinned jj 0.41.0 tarball by SHA + distro git, then runs the
@@ -16,7 +16,7 @@ RUN go build -o /out/gateway ./cmd/
 # never mount/PID1/stop semantics (those belong to container-proof.sh
 # runtime rows; never credited across).
 FROM build AS test
-RUN apt-get update && apt-get install -y --no-install-recommends git curl ca-certificates && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y --no-install-recommends git curl ca-certificates nodejs npm python3 python3-pip && rm -rf /var/lib/apt/lists/*
 ARG TARGETARCH
 RUN set -eu; \
   case "${TARGETARCH:-amd64}" in \
@@ -29,20 +29,34 @@ RUN set -eu; \
   tar -xzf /tmp/jj.tar.gz -C /usr/local/bin --strip-components=1 --wildcards '*/jj'; \
   chmod 755 /usr/local/bin/jj; \
   rm /tmp/jj.tar.gz
+# Phase 2a prefetch (network at build only): warm the npx cache and
+# install the time module so the driver runs cached/offline. The `|| true`
+# only tolerates the expected bad-dir exit; an actually missing server
+# still fails the suite below as SERVER_MISSING (fail-closed).
+RUN npx -y @modelcontextprotocol/server-filesystem@2026.8.31 --help >/dev/null 2>&1 || true
+RUN python3 -m pip install --break-system-packages mcp-server-time==2026.8.18
 RUN go test ./internal/gateway/ -count=1
 
 # Runtime: node LTS slim (Debian trixie).
 FROM node:lts-trixie-slim
 # One apt layer: git (VCS tooling) + tini (PID 1) + pipx (classic
-# entry-point installs) + curl/ca-certificates (jj tarball fetch only).
+# entry-point installs) + curl/ca-certificates (jj tarball fetch only)
+# + python3/pip (Phase 2b live downstreams; node base lacks them).
 RUN apt-get update \
- && apt-get install -y --no-install-recommends git tini pipx curl ca-certificates \
+ && apt-get install -y --no-install-recommends git tini pipx curl ca-certificates python3 python3-pip \
  && rm -rf /var/lib/apt/lists/*
 # uv/uvx for modern PEP 723/pyproject flows (joint decision: both uv and
 # pipx are carried — neither is an MCP installer, both are runners).
 # Pinned into /var/lib/mcp/pipx (on PATH below) so arbitrary runtime UIDs
 # invoke the same binaries (no per-user installs).
 RUN mkdir -p /var/lib/mcp/pipx && PIPX_HOME=/var/lib/mcp/pipx PIPX_BIN_DIR=/var/lib/mcp/pipx/bin pipx install uv
+# Phase 2b live downstreams (network at build only; versions recorded):
+# filesystem server pinned globally via npm (world-executable bin);
+# time server via pip — NOT pipx: `python3 -m` needs the module
+# importable in system python, which pipx isolation breaks, so the
+# Debian-trixie-correct `pip install --break-system-packages` form.
+RUN npm install -g @modelcontextprotocol/server-filesystem@2026.8.31
+RUN pip install --break-system-packages mcp-server-time==2026.8.18
 # jj 0.41.0 official prebuilt linux-musl tarballs, SHA256 verified.
 # Source: jj-vcs/jj release 318923928 asset digests (musl static, no glibc).
 #   amd64: sha256:42181a80d316ac157874c817c9945e104275114fb461d99e06e2312502f08f99
@@ -71,33 +85,33 @@ ENV HOME=/tmp \
     PIPX_HOME=/var/lib/mcp/pipx \
     PIPX_BIN_DIR=/var/lib/mcp/pipx/bin \
     PATH="/opt/mcp/bin:/var/lib/mcp/pipx/bin:${PATH}"
-# Frozen COPY: EXACTLY TWO build-context artifacts (gateway binary via the
+# Frozen COPY: EXACTLY TWO build-context artifacts (localbridge binary via the
 # build stage + entrypoint script). tini/jj arrive via their own install
 # steps, never via COPY. Runtime-needed files stay world-executable
 # (arbitrary runtime UIDs must exec them: 0755 pinned here).
-COPY --from=build --chmod=755 /out/gateway /opt/mcp/bin/gateway
+COPY --from=build --chmod=755 /out/localbridge /opt/mcp/bin/localbridge
 COPY --chmod=755 docker/entrypoint.sh /usr/local/bin/entrypoint.sh
 USER mcp
 # Build-time assertions (parsed comparisons, never print-only):
-# git >= 2.41, jj == 0.41.0-prefix exact, 0755 on gateway/entrypoint/
-# tini/jj, gateway executes (serving needs creds — out of envelope
+# git >= 2.41, jj == 0.41.0-prefix exact, 0755 on localbridge/entrypoint/
+# tini/jj, localbridge executes (serving needs creds — out of envelope
 # scope; assert it starts and reports config, no crash/hang).
 RUN set -eu; \
   GV=$(git --version | awk '{print $3}'); \
   LOWEST=$(printf '2.41.0\n%s\n' "$GV" | sort -V | head -n1); \
   [ "$LOWEST" = "2.41.0" ] || { echo "git $GV < 2.41"; exit 1; }; \
   case "$(jj --version)" in "jj 0.41.0"*) ;; *) echo "jj version mismatch: $(jj --version)"; exit 1 ;; esac; \
-  [ "$(stat -c %a /opt/mcp/bin/gateway)" = "755" ] || { echo "gateway mode"; exit 1; }; \
+  [ "$(stat -c %a /opt/mcp/bin/localbridge)" = "755" ] || { echo "localbridge mode"; exit 1; }; \
   [ "$(stat -c %a /usr/local/bin/entrypoint.sh)" = "755" ] || { echo "entrypoint mode"; exit 1; }; \
   [ "$(stat -c %a "$(command -v tini)")" = "755" ] || { echo "tini mode"; exit 1; }; \
   [ "$(stat -c %a /usr/local/bin/jj)" = "755" ] || { echo "jj mode"; exit 1; }; \
-  set +e; timeout 10 /opt/mcp/bin/gateway > /tmp/smoke.log 2>&1; CODE=$?; set -e; \
+  set +e; timeout 10 /opt/mcp/bin/localbridge > /tmp/smoke.log 2>&1; CODE=$?; set -e; \
   cat /tmp/smoke.log; rm /tmp/smoke.log; \
-  if [ "$CODE" -eq 124 ]; then echo "gateway hung (timeout kill)"; exit 1; fi; \
-  if [ "$CODE" -eq 127 ] || [ "$CODE" -gt 128 ]; then echo "gateway crash/not-found ($CODE)"; exit 1; fi; \
-  echo "gateway smoke exit: $CODE (serving needs creds — out of scope)"
+  if [ "$CODE" -eq 124 ]; then echo "localbridge hung (timeout kill)"; exit 1; fi; \
+  if [ "$CODE" -eq 127 ] || [ "$CODE" -gt 128 ]; then echo "localbridge crash/not-found ($CODE)"; exit 1; fi; \
+  echo "localbridge smoke exit: $CODE (serving needs creds — out of scope)"
 ENTRYPOINT ["tini", "--", "/usr/local/bin/entrypoint.sh"]
-CMD ["/opt/mcp/bin/gateway"]
+CMD ["/opt/mcp/bin/localbridge"]
 # No VOLUME declared (image stays plain); persistence is a RUNTIME
 # contract (:ro, --read-only, --tmpfs /tmp, volume mounts) enforced by
 # scripts/container-proof.sh + documented run flags.

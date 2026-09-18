@@ -18,7 +18,7 @@ set -eu
 
 IMAGE="${1:?usage: container-proof.sh <image>}"
 BUILD_TIMEOUT="${BUILD_TIMEOUT:-1800}"
-# Compose rows pin the proof image (default tag local-mcp); --no-build
+# Compose rows pin the proof image (default tag localbridge); --no-build
 # on every compose run row (never build implicitly).
 LOCAL_MCP_IMAGE="${LOCAL_MCP_IMAGE:-$IMAGE}"
 export LOCAL_MCP_IMAGE
@@ -53,7 +53,7 @@ cleanup() {
 	fi
 	docker rm -f "$REAP_C" "$CANARY_C" >/dev/null 2>&1 || true
 	if [ -n "$C2OVERRIDE" ]; then
-		docker compose -p "$CPROJ" -f docker-compose.yml -f "$C2OVERRIDE" rm -sf gateway >/dev/null 2>&1 || true
+		docker compose -p "$CPROJ" -f docker-compose.yml -f "$C2OVERRIDE" rm -sf localbridge >/dev/null 2>&1 || true
 	fi
 	docker volume rm -f "$V_NPM" "$V_UV" "$V_PIPX" >/dev/null 2>&1 || true
 }
@@ -110,7 +110,7 @@ timeout "$BUILD_TIMEOUT" docker build -t "$IMAGE" -f Dockerfile . || fail "docke
 # Never credited with mount/PID1/stop semantics (runtime rows below)
 # and vice versa.
 echo "== build-test-stage"
-timeout "$BUILD_TIMEOUT" docker build --target test -t local-mcp:test -f Dockerfile . || fail "test stage"
+timeout "$BUILD_TIMEOUT" docker build --target test -t localbridge:test -f Dockerfile . || fail "test stage"
 
 # ---- 2. Volumes null (image stays plain) ----
 echo "== volumes-null"
@@ -140,7 +140,7 @@ fi
 echo "== binary-smoke"
 SMOKE_OUT="$T/smoke.txt"
 set +e
-timeout 120 docker run $DFLAGS -e WORKSPACE_ROOT=/workspace "$IMAGE" /opt/mcp/bin/gateway > "$SMOKE_OUT" 2>&1
+timeout 120 docker run $DFLAGS -e WORKSPACE_ROOT=/workspace "$IMAGE" /opt/mcp/bin/localbridge > "$SMOKE_OUT" 2>&1
 SMOKE_CODE=$?
 set -e
 cat "$SMOKE_OUT"
@@ -292,6 +292,29 @@ if timeout 120 docker run $DFLAGS "$IMAGE" env | grep -E "OPENAI_TUNNEL_ID|OPENA
 	fail "secret in runtime env"
 fi
 
+# ---- 12b. Phase 2b live downstreams (versions + runnable) ----
+echo "== downstream-versions"
+timeout 120 docker run --rm "$IMAGE" npm ls -g @modelcontextprotocol/server-filesystem 2>/dev/null | grep -q "2026.8.31" || fail "filesystem version"
+timeout 120 docker run --rm "$IMAGE" pip show mcp-server-time 2>/dev/null | grep -q "^Version: 2026.8.18" || fail "time version"
+echo "== downstream-runnable"
+# Exact working commands pinned here: stdio initialize handshake
+# asserting protocolVersion in the response (stdin held open: an
+# immediate EOF can win the race and mute the server). Filesystem runs
+# via the globally installed binary (NOT npx: --no-install still fetches
+# registry metadata, breaking offline runs).
+(printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"p","version":"0"}}}' '{"jsonrpc":"2.0","method":"notifications/initialized"}'; sleep 2) | timeout 120 docker run --rm -i --read-only --tmpfs /tmp "$IMAGE" mcp-server-filesystem /tmp > "$T/fs-handshake.txt" 2>&1 || fail "filesystem start"
+grep -q '"protocolVersion"' "$T/fs-handshake.txt" || fail "filesystem handshake"
+(printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"p","version":"0"}}}' '{"jsonrpc":"2.0","method":"notifications/initialized"}'; sleep 2) | timeout 120 docker run --rm -i --read-only --tmpfs /tmp "$IMAGE" python3 -m mcp_server_time > "$T/time-handshake.txt" 2>&1 || fail "time start"
+grep -q '"protocolVersion"' "$T/time-handshake.txt" || fail "time handshake"
+echo "== init-sh"
+[ ! -x init.sh ] || fail "init.sh must not carry the exec bit"
+grep -q "sh init.sh" init.sh || fail "init.sh invocation undocumented"
+sh -n init.sh || fail "init.sh syntax"
+# No sudo COMMANDS (comments stripped first, like the scope proofs).
+if sed 's/#.*//' init.sh | grep -qw "sudo"; then
+	fail "init.sh must not sudo"
+fi
+
 # ---- 13. compose rows (C2: Docker-secrets delivery, no real creds) ----
 # Mapping lives in Go config parsing now (cmd matrix proves it); these
 # rows prove DELIVERY: files mounted readable, _FILE passthrough
@@ -316,8 +339,8 @@ mkoverride() {
 	# (no `run` anywhere).
 	cat > "$T/override.yml" <<EOF
 services:
-  gateway:
-    image: ${LOCAL_MCP_IMAGE:-local-mcp}
+  localbridge:
+    image: ${LOCAL_MCP_IMAGE:-localbridge}
     command: ["env"]
 ${2:-}
 secrets:
@@ -333,8 +356,8 @@ mkovempty() {
 	# (absent path) while secrets stay mounted-but-unused.
 	cat > "$T/override-empty.yml" <<EOF
 services:
-  gateway:
-    image: ${LOCAL_MCP_IMAGE:-local-mcp}
+  localbridge:
+    image: ${LOCAL_MCP_IMAGE:-localbridge}
     command: ["env"]
     environment:
       OPENAI_TUNNEL_ID_FILE: ""
@@ -356,13 +379,13 @@ c2up() {
 	_out=$1
 	# up -d output lands in the file too (mount-time refusals surface
 	# here, before any container exists to log).
-	if ! timeout 120 docker compose -p "$CPROJ" -f docker-compose.yml -f "$C2OVERRIDE" up -d gateway >"$_out" 2>&1; then
-		docker compose -p "$CPROJ" -f docker-compose.yml -f "$C2OVERRIDE" rm -sf gateway >/dev/null 2>&1 || true
+	if ! timeout 120 docker compose -p "$CPROJ" -f docker-compose.yml -f "$C2OVERRIDE" up -d localbridge >"$_out" 2>&1; then
+		docker compose -p "$CPROJ" -f docker-compose.yml -f "$C2OVERRIDE" rm -sf localbridge >/dev/null 2>&1 || true
 		return 1
 	fi
-	_code=$(timeout 120 docker wait "$CPROJ-gateway-1" 2>/dev/null) || _code=124
-	timeout 120 docker logs "$CPROJ-gateway-1" >"$_out" 2>&1 || true
-	docker compose -p "$CPROJ" -f docker-compose.yml -f "$C2OVERRIDE" rm -sf gateway >/dev/null 2>&1 || true
+	_code=$(timeout 120 docker wait "$CPROJ-localbridge-1" 2>/dev/null) || _code=124
+	timeout 120 docker logs "$CPROJ-localbridge-1" >"$_out" 2>&1 || true
+	docker compose -p "$CPROJ" -f docker-compose.yml -f "$C2OVERRIDE" rm -sf localbridge >/dev/null 2>&1 || true
 	case "$_code" in
 	'' | *[!0-9]*) return 1 ;;
 	*) return "$_code" ;;

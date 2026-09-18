@@ -13,9 +13,9 @@
 # This file itself is TRUSTED input: `file:` refs read host files at
 # config-processing time. Never presented as a sandbox.
 services:
-  gateway:
+  localbridge:
     build: .
-    image: local-mcp
+    image: localbridge
     # Run as container UID 0. Under rootless Docker, container root maps
     # to the host OPERATOR (not host root) — the primary model: the
     # gateway reads the repo and secrets with operator file access and
@@ -23,10 +23,12 @@ services:
     # compose overrides it here.)
     user: 0:0
     # Default entrypoint/cmd from the image (tini + entrypoint.sh +
-    # gateway binary). MCP --profile flags pass via `command:` override,
-    # e.g. `command: ["/opt/mcp/bin/gateway", "--config", "/opt/mcp/config/gateway.yaml", "--profile", "go"]`.
+    # localbridge binary). Live sweep overrides the command to serve the
+    # mounted config with the live profile (executable included):
+    #   command: ["/opt/mcp/bin/localbridge", "--config", "/opt/mcp/config/gateway.yaml", "--profile", "live"]
     # NOTE: compose `profiles:` key is NOT used — the name collides with
     # MCP --profile and would confuse both. Disclaimed explicitly.
+    command: ["/opt/mcp/bin/localbridge", "--config", "/opt/mcp/config/gateway.yaml", "--profile", "live"]
     read_only: true
     tmpfs:
       - /tmp
@@ -34,6 +36,7 @@ services:
       # Repo root mounts directly (absolute target; relative-target form
       # rejected).
       - .:/workspace:ro
+      - ./gateway.yaml:/opt/mcp/config/gateway.yaml:ro
       - cache:/var/lib/mcp
     environment:
       # Docker-secrets delivery (Go resolves _FILE -> var, then unsets

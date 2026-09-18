@@ -1,0 +1,17 @@
+# Gateway live config (Phase 2b container sweep): one `live` profile
+# with two stdio downstreams. No secrets, no deny games (plain
+# forwarding proof; deny/mask proven in-process in Phase 1).
+# NOTE: repo-root config enters the Docker build context — never bake
+# secrets into this file (there are none here by construction).
+servers:
+  filesystem:
+    type: local
+    profiles: [live]
+    # Globally installed binary (NOT npx: npx --no-install still hits
+    # the registry for metadata, breaking offline serving; the global
+    # install is the pinned 2026.8.31 by construction).
+    command: [mcp-server-filesystem, /workspace]
+  time:
+    type: local
+    profiles: [live]
+    command: [python3, -m, mcp_server_time]
