@@ -40,7 +40,9 @@ RUN apt-get update \
  && rm -rf /var/lib/apt/lists/*
 # uv/uvx for modern PEP 723/pyproject flows (joint decision: both uv and
 # pipx are carried — neither is an MCP installer, both are runners).
-RUN pipx install uv
+# Pinned into /var/lib/mcp/pipx (on PATH below) so arbitrary runtime UIDs
+# invoke the same binaries (no per-user installs).
+RUN mkdir -p /var/lib/mcp/pipx && PIPX_HOME=/var/lib/mcp/pipx PIPX_BIN_DIR=/var/lib/mcp/pipx/bin pipx install uv
 # jj 0.41.0 official prebuilt linux-musl tarballs, SHA256 verified.
 # Source: jj-vcs/jj release 318923928 asset digests (musl static, no glibc).
 #   amd64: sha256:42181a80d316ac157874c817c9945e104275114fb461d99e06e2312502f08f99
@@ -67,21 +69,28 @@ ENV HOME=/tmp \
     NPM_CONFIG_CACHE=/var/lib/mcp/npm \
     UV_CACHE_DIR=/var/lib/mcp/uv \
     PIPX_HOME=/var/lib/mcp/pipx \
-    PATH="/opt/mcp/bin:${PATH}"
+    PIPX_BIN_DIR=/var/lib/mcp/pipx/bin \
+    PATH="/opt/mcp/bin:/var/lib/mcp/pipx/bin:${PATH}"
 # Frozen COPY: EXACTLY TWO build-context artifacts (gateway binary via the
 # build stage + entrypoint script). tini/jj arrive via their own install
-# steps, never via COPY.
-COPY --from=build /out/gateway /opt/mcp/bin/gateway
+# steps, never via COPY. Runtime-needed files stay world-executable
+# (arbitrary runtime UIDs must exec them: 0755 pinned here).
+COPY --from=build --chmod=755 /out/gateway /opt/mcp/bin/gateway
 COPY --chmod=755 docker/entrypoint.sh /usr/local/bin/entrypoint.sh
 USER mcp
 # Build-time assertions (parsed comparisons, never print-only):
-# git >= 2.41, jj == 0.41.0 exact, gateway executes (serving needs creds —
-# out of envelope scope; assert it starts and reports config, no crash).
+# git >= 2.41, jj == 0.41.0-prefix exact, 0755 on gateway/entrypoint/
+# tini/jj, gateway executes (serving needs creds — out of envelope
+# scope; assert it starts and reports config, no crash/hang).
 RUN set -eu; \
   GV=$(git --version | awk '{print $3}'); \
   LOWEST=$(printf '2.41.0\n%s\n' "$GV" | sort -V | head -n1); \
   [ "$LOWEST" = "2.41.0" ] || { echo "git $GV < 2.41"; exit 1; }; \
   case "$(jj --version)" in "jj 0.41.0"*) ;; *) echo "jj version mismatch: $(jj --version)"; exit 1 ;; esac; \
+  [ "$(stat -c %a /opt/mcp/bin/gateway)" = "755" ] || { echo "gateway mode"; exit 1; }; \
+  [ "$(stat -c %a /usr/local/bin/entrypoint.sh)" = "755" ] || { echo "entrypoint mode"; exit 1; }; \
+  [ "$(stat -c %a "$(command -v tini)")" = "755" ] || { echo "tini mode"; exit 1; }; \
+  [ "$(stat -c %a /usr/local/bin/jj)" = "755" ] || { echo "jj mode"; exit 1; }; \
   set +e; timeout 10 /opt/mcp/bin/gateway > /tmp/smoke.log 2>&1; CODE=$?; set -e; \
   cat /tmp/smoke.log; rm /tmp/smoke.log; \
   if [ "$CODE" -eq 124 ]; then echo "gateway hung (timeout kill)"; exit 1; fi; \

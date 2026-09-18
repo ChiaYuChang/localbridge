@@ -301,15 +301,15 @@ echo "== compose-config"
 # pinned via LOCAL_MCP_IMAGE + presence-gated, so no row ever builds
 # implicitly.
 CPROJ="c2proof$$"
-# Temp fixtures WITHOUT host sudo: container-root helper chowns the
-# bind-mounted temp dir (documents the no-sudo path). NEVER repo
-# .secrets (no repo residue; $T cleanup via trap).
+# Temp fixtures need NO privilege: created by the invoking user they are
+# already correctly owned — VERIFY, never chown. NEVER repo .secrets
+# (no repo residue; $T cleanup via trap).
 C2S="$T/c2secrets"
 mkdir -p "$C2S"
 printf 'tid-123\n' > "$C2S/tunnel_id"
 printf '  spaced-key  \n' > "$C2S/api_key"
-timeout 120 docker run --rm --user 0 --entrypoint sh -v "$C2S:/w" "$IMAGE" -c 'chown 10001:10001 /w/tunnel_id /w/api_key && chmod 0400 /w/tunnel_id /w/api_key' || fail "secret fixture chown"
-[ "$(stat -c %u:%a "$C2S/tunnel_id")" = "10001:400" ] || fail "fixture perms"
+chmod 0400 "$C2S/tunnel_id" "$C2S/api_key"
+[ "$(stat -c %u:%a "$C2S/tunnel_id")" = "$(id -u):400" ] || fail "fixture owner must equal invoking UID"
 mkoverride() {
 	# $1 = secrets dir; $2 = extra environment YAML lines (optional).
 	# Command is ALWAYS ["env"]: rows assert env output via up/logs
@@ -371,7 +371,21 @@ c2up() {
 mkoverride "$C2S"
 timeout 120 docker compose -p "$CPROJ" -f docker-compose.yml -f "$T/override.yml" config > "$T/cfg.txt" 2>&1 || fail "compose config"
 grep -q "image: $IMAGE" "$T/cfg.txt" || fail "image pin"
+grep -q "0:0" "$T/cfg.txt" || fail "user 0:0 pin"
 docker image inspect "$IMAGE" >/dev/null || fail "pinned image missing"
+# Rendered config leaks no secret values (paths only; values unknowable
+# outside the mounts — the proof's own fixture values must not appear).
+if grep -q "tid-123" "$T/cfg.txt" || grep -q "spaced-key" "$T/cfg.txt"; then
+	fail "config leaks secret values"
+fi
+echo "== root-model"
+# Rootless primary model: container UID 0 (maps to the host operator,
+# not host root). Repo + operator-owned 0400 secrets readable as root;
+# cache volume writable as root.
+[ "$(timeout 120 docker run --rm --user 0:0 "$IMAGE" id -u)" = "0" ] || fail "euid 0 in-container"
+timeout 120 docker run --rm --read-only --tmpfs /tmp --user 0:0 -v "$WS:/workspace:ro" "$IMAGE" sh -c 'test -r /workspace/file.txt' || fail "repo readable as root"
+timeout 120 docker run --rm --user 0:0 -v "$C2S:/run/secrets:ro" "$IMAGE" sh -c 'test -r /run/secrets/tunnel_id && test -r /run/secrets/api_key' || fail "secrets readable as root"
+timeout 120 docker run --rm --user 0:0 -v "$V_NPM:/var/lib/mcp/npm" "$IMAGE" sh -c 'touch /var/lib/mcp/npm/rootw' || fail "cache writable as root"
 echo "== compose-file-presence"
 # Entrypoint performs NO mapping now (single-owner Go): _FILE lines pass
 # through verbatim; direct secret vars stay absent.
@@ -385,11 +399,22 @@ echo "== compose-caches"
 for kv in "npm_config_cache=/var/lib/mcp/npm" "UV_CACHE_DIR=/var/lib/mcp/uv" "PIPX_HOME=/var/lib/mcp/pipx" "PIPX_BIN_DIR=/var/lib/mcp/pipx/bin" "HOME=/tmp"; do
 	grep -qxF "$kv" "$T/cenv.txt" || fail "cache env $kv"
 done
+echo "== workspace-root"
+# Without WORKSPACE_ROOT the gateway serves the process cwd (container
+# /): list_directory(.) would list the container root and git/jj roots
+# follow to /. The env assert fails on the old behavior (var absent);
+# the mount assert proves the workspace the gateway WILL serve shows
+# repo content (AGENTS.md present, container-root entries absent).
+# (Serving itself needs tunnel creds — out of proof scope; the default
+# chain filesystem.New+cwd and the ResolveRoot workspace fallbacks are
+# unit-tested in cmd/git/jj suites.)
+grep -qxF "WORKSPACE_ROOT=/workspace" "$T/cenv.txt" || fail "WORKSPACE_ROOT unset"
+timeout 120 docker run --rm --read-only --tmpfs /tmp -v "$(pwd):/workspace:ro" "$IMAGE" sh -c 'test -f /workspace/AGENTS.md && test ! -e /workspace/bin && test ! -e /workspace/etc' || fail "workspace mount content"
 echo "== compose-readability"
-# Mounted fakes readable as the container user (mcp, not root).
-timeout 120 docker run --rm -v "$C2S:/run/secrets:ro" \
+# Mounted fakes readable as container root (compose user 0:0 model).
+timeout 120 docker run --rm --user 0:0 -v "$C2S:/run/secrets:ro" \
 	-e OPENAI_TUNNEL_ID_FILE=/run/secrets/tunnel_id -e OPENAI_API_KEY_FILE=/run/secrets/api_key \
-	"$IMAGE" sh -c 'test -r "$OPENAI_TUNNEL_ID_FILE" && test -r "$OPENAI_API_KEY_FILE"' || fail "secrets unreadable as container user"
+	"$IMAGE" sh -c 'test -r "$OPENAI_TUNNEL_ID_FILE" && test -r "$OPENAI_API_KEY_FILE"' || fail "secrets unreadable as root"
 echo "== compose-direct-env"
 mkovempty "$C2S" "      OPENAI_TUNNEL_ID: direct1
       OPENAI_API_KEY: direct2"
@@ -404,8 +429,12 @@ if grep -q "^OPENAI_TUNNEL_ID=" "$T/nenv.txt"; then
 fi
 echo "== compose-hygiene"
 [ -z "$(find . -path ./.devenv -prune -o -name '*.example' -print)" ] || fail "*.example files present"
-if grep -qxF "secrets/" .gitignore || grep -qxF "secrets/" .dockerignore || grep -qxF ".secrets/" .gitignore || grep -qxF ".secrets/" .dockerignore; then
-	fail "stale secrets ignore present (no in-repo secrets)"
+# Insurance form only: `.secrets/` present in both ignores, bare
+# `secrets/` absent from both (stale).
+grep -qxF ".secrets/" .gitignore || fail ".gitignore lacks .secrets/ insurance"
+grep -qxF ".secrets/" .dockerignore || fail ".dockerignore lacks .secrets/ insurance"
+if grep -qxF "secrets/" .gitignore || grep -qxF "secrets/" .dockerignore; then
+	fail "stale secrets/ ignore present"
 fi
 # Tracked subset: operator-local secret files are untracked by design;
 # the only trackable member is .gitkeep (placeholder).

@@ -16,6 +16,12 @@ services:
   gateway:
     build: .
     image: local-mcp
+    # Run as container UID 0. Under rootless Docker, container root maps
+    # to the host OPERATOR (not host root) — the primary model: the
+    # gateway reads the repo and secrets with operator file access and
+    # no fixed service UID. (Image direct-run default stays USER mcp;
+    # compose overrides it here.)
+    user: 0:0
     # Default entrypoint/cmd from the image (tini + entrypoint.sh +
     # gateway binary). MCP --profile flags pass via `command:` override,
     # e.g. `command: ["/opt/mcp/bin/gateway", "--config", "/opt/mcp/config/gateway.yaml", "--profile", "go"]`.
@@ -34,6 +40,12 @@ services:
       # _FILE; direct env preserved when _FILE absent).
       OPENAI_TUNNEL_ID_FILE: /run/secrets/tunnel_id
       OPENAI_API_KEY_FILE: /run/secrets/api_key
+      # Explicit over the gateway's cwd default: without this the
+      # gateway serves the process cwd (container /), so list_directory
+      # and the git/jj roots would follow to /. GIT_ROOT/JJ_ROOT need
+      # NO separate env: both ResolveRoot helpers fall back to the
+      # workspace root when their env is empty (unit-tested).
+      WORKSPACE_ROOT: /workspace
       # Runner caches (frozen values so G1-sanitized children keep
       # runners functional; PIPX_BIN_DIR/HOME choice documented: HOME is
       # /tmp per image contract, binaries land via explicit env below).
@@ -48,26 +60,27 @@ services:
     # NO restart key (short-lived design; daemon behavior via user
     # override file, never default). NO ports (tunnel-attached only).
     #
-    # SECRET BOOTSTRAP (root/sudo REQUIRED for the chown — stated
-    # explicitly, no silent assumption; rootful-only: the chown/chmod
-    # below need privilege, there is no rootless bootstrap path).
-    # NEVER commit. No `.example` secret files (example secrets invite
-    # accidents — docs show printf commands instead):
+    # SECRET BOOTSTRAP (rootless-only contract — stated explicitly, no
+    # silent assumption; rootful explicitly DEFERRED, never silently
+    # supported). NEVER commit. No `.example` secret files (example
+    # secrets invite accidents — docs show printf commands instead).
+    # Owner MUST equal the invoking UID (+0400). Self-created files are
+    # already correct — VERIFY ownership, don't chown unconditionally:
     #   mkdir -p ~/Private/secrets/openai_tunnel
     #   printf %s "$TUNNEL_ID" > ~/Private/secrets/openai_tunnel/tunnel_id
     #   printf %s "$API_KEY" > ~/Private/secrets/openai_tunnel/api_key
-    #   sudo chown 10001:10001 ~/Private/secrets/openai_tunnel/tunnel_id ~/Private/secrets/openai_tunnel/api_key
+    #   [ "$(stat -c %u ~/Private/secrets/openai_tunnel/tunnel_id)" = "$(id -u)" ] || sudo chown "$(id -u)" ~/Private/secrets/openai_tunnel/tunnel_id ~/Private/secrets/openai_tunnel/api_key
     #   chmod 0400 ~/Private/secrets/openai_tunnel/tunnel_id ~/Private/secrets/openai_tunnel/api_key
     # Compose file-backed secrets preserve host ownership/mode
     # (`uid`/`gid`/`mode` keys are IGNORED locally with a warning);
-    # without the chown the fixed `USER mcp` gets Permission denied
-    # (probed failure, not theory).
+    # wrong ownership fails reads as container root mapped to a
+    # different host user (fail-closed, probed failure, not theory).
 
 secrets:
   tunnel_id:
-    file: ${HOME}/Private/secrets/openai_tunnel/tunnel_id
+    file: ${HOME}/.openai_tunnel_id
   api_key:
-    file: ${HOME}/Private/secrets/openai_tunnel/api_key
+    file: ${HOME}/.openai_api_key
 
 volumes:
   cache:

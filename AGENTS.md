@@ -64,9 +64,9 @@
 
 ## Active State & In-Flight Context
 
-- **Observed-At**: `2026-09-18T20:41:12Z - C2-followup+DELTA unsealed (seal pending)`
-- **Dirty Status**: `dirty (C2-followup + DELTA + AGENTS.md unsealed; SCAN clean; barrier pass; DELTA_PASS final)`
-- **Milestone**: `COMMIT_FLOW_STEP_7 - DELTA_PASS final, seal message presented, awaiting auth`
-- **Next Pickup Item**: `User auth (ok) -> jj commit, or renewed intent on deny`
+- **Observed-At**: `2026-09-19T01:10:36Z - refactor(compose) sealed`
+- **Dirty Status**: `dirty (AGENTS.md seal-state update only; sealed change clean)`
+- **Milestone**: `COMMIT_SEALED - refactor(compose): rootless UID-0 runtime model; local only, no push`
+- **Next Pickup Item**: `Informal online sweep 17/17 PASS (2026-09-19); G5 formal E2E still needs staging creds`
 - **Commit Ordering Rule**: All `AGENTS.md` content updates land PRE-seal. `Observed-At` carries timestamp + sealed message only, never commit hashes (hashes mutate on squash and live authoritatively in `jj log`); no post-seal squash cycle exists.
 - **Ground Truth Revalidation Invariant**: Cold-start Planners MUST run fresh VCS status/log inspection; never trust cached Active State.

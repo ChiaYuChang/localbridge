@@ -128,7 +128,7 @@ func run(ctx context.Context, configPath string, profiles []string) error {
 		_ = gw.Close()
 		return err
 	}
-	fmt.Fprintln(os.Stderr, "tunnel-client SDK example connected")
+	fmt.Fprintln(os.Stderr, "local-mcp gateway tunnel connected")
 
 	select {
 	case <-ctx.Done():
