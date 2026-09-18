@@ -66,14 +66,19 @@ services:
     # SECRET BOOTSTRAP (rootless-only contract — stated explicitly, no
     # silent assumption; rootful explicitly DEFERRED, never silently
     # supported). NEVER commit. No `.example` secret files (example
-    # secrets invite accidents — docs show printf commands instead).
-    # Owner MUST equal the invoking UID (+0400). Self-created files are
-    # already correct — VERIFY ownership, don't chown unconditionally:
-    #   mkdir -p ~/Private/secrets/openai_tunnel
-    #   printf %s "$TUNNEL_ID" > ~/Private/secrets/openai_tunnel/tunnel_id
-    #   printf %s "$API_KEY" > ~/Private/secrets/openai_tunnel/api_key
-    #   [ "$(stat -c %u ~/Private/secrets/openai_tunnel/tunnel_id)" = "$(id -u)" ] || sudo chown "$(id -u)" ~/Private/secrets/openai_tunnel/tunnel_id ~/Private/secrets/openai_tunnel/api_key
-    #   chmod 0400 ~/Private/secrets/openai_tunnel/tunnel_id ~/Private/secrets/openai_tunnel/api_key
+    # secrets invite accidents — no example content lives here).
+    # Secret home is `~/.config/localbridge/` (single location for
+    # bootstrap docs, init.sh, compose refs, and proof contract —
+    # grep-zero enforced on all older locations).
+    # Required paths (create them yourself — localbridge NEVER creates
+    # or writes secrets; provisioning recipes live nowhere in this
+    # repo by design):
+    #   ~/.config/localbridge/openai_tunnel_id (0400, owner = you)
+    #   ~/.config/localbridge/openai_api_key  (0400, owner = you)
+    # Dir 0700. Owner MUST equal the invoking UID — VERIFY, never
+    # repair: a mismatch is a fail-closed error, not a chown invocation
+    # (no repair path exists by design).
+    #   for f in openai_tunnel_id openai_api_key; do [ "$(stat -c %u ~/.config/localbridge/$f)" = "$(id -u)" ] || { echo "owner mismatch: $f" >&2; exit 1; }; done
     # Compose file-backed secrets preserve host ownership/mode
     # (`uid`/`gid`/`mode` keys are IGNORED locally with a warning);
     # wrong ownership fails reads as container root mapped to a
@@ -81,9 +86,9 @@ services:
 
 secrets:
   tunnel_id:
-    file: ${HOME}/.openai_tunnel_id
+    file: ${HOME}/.config/localbridge/openai_tunnel_id
   api_key:
-    file: ${HOME}/.openai_api_key
+    file: ${HOME}/.config/localbridge/openai_api_key
 
 volumes:
   cache:

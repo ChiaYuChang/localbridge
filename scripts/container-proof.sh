@@ -310,9 +310,18 @@ echo "== init-sh"
 [ ! -x init.sh ] || fail "init.sh must not carry the exec bit"
 grep -q "sh init.sh" init.sh || fail "init.sh invocation undocumented"
 sh -n init.sh || fail "init.sh syntax"
-# No sudo COMMANDS (comments stripped first, like the scope proofs).
 if sed 's/#.*//' init.sh | grep -qw "sudo"; then
 	fail "init.sh must not sudo"
+fi
+# Regular-file gate: static presence (the -f check in the per-file
+# loop) plus behavioral refusal of a dir-shaped secret under a fake
+# HOME. Note: preflight (rootless check) precedes the gate, so on
+# non-rootless hosts the non-zero exit may come from preflight — the
+# static assert above pins the gate itself.
+grep -q '\[ ! -f "\$SECDIR/\$f" \]' init.sh || fail "regular-file gate missing"
+mkdir -p "$T/fakehome/.config/localbridge/openai_tunnel_id"
+if HOME="$T/fakehome" sh init.sh >/dev/null 2>&1; then
+	fail "dir-shaped secret must refuse"
 fi
 
 # ---- 13. compose rows (C2: Docker-secrets delivery, no real creds) ----
@@ -329,10 +338,10 @@ CPROJ="c2proof$$"
 # (no repo residue; $T cleanup via trap).
 C2S="$T/c2secrets"
 mkdir -p "$C2S"
-printf 'tid-123\n' > "$C2S/tunnel_id"
-printf '  spaced-key  \n' > "$C2S/api_key"
-chmod 0400 "$C2S/tunnel_id" "$C2S/api_key"
-[ "$(stat -c %u:%a "$C2S/tunnel_id")" = "$(id -u):400" ] || fail "fixture owner must equal invoking UID"
+printf 'tid-123\n' > "$C2S/openai_tunnel_id"
+printf '  spaced-key  \n' > "$C2S/openai_api_key"
+chmod 0400 "$C2S/openai_tunnel_id" "$C2S/openai_api_key"
+[ "$(stat -c %u:%a "$C2S/openai_tunnel_id")" = "$(id -u):400" ] || fail "fixture owner must equal invoking UID"
 mkoverride() {
 	# $1 = secrets dir; $2 = extra environment YAML lines (optional).
 	# Command is ALWAYS ["env"]: rows assert env output via up/logs
@@ -345,9 +354,9 @@ services:
 ${2:-}
 secrets:
   tunnel_id:
-    file: $1/tunnel_id
+    file: $1/openai_tunnel_id
   api_key:
-    file: $1/api_key
+    file: $1/openai_api_key
 EOF
 	C2OVERRIDE="$T/override.yml"
 }
@@ -365,9 +374,9 @@ services:
 ${2:-}
 secrets:
   tunnel_id:
-    file: $1/tunnel_id
+    file: $1/openai_tunnel_id
   api_key:
-    file: $1/api_key
+    file: $1/openai_api_key
 EOF
 	C2OVERRIDE="$T/override-empty.yml"
 }
@@ -401,13 +410,33 @@ docker image inspect "$IMAGE" >/dev/null || fail "pinned image missing"
 if grep -q "tid-123" "$T/cfg.txt" || grep -q "spaced-key" "$T/cfg.txt"; then
 	fail "config leaks secret values"
 fi
+echo "== secret-contract"
+# CROSS-SURFACE assert (FF-3): the compose DEFAULT file refs (no
+# override — overrides mask the defaults that caused the original
+# contradiction) must equal the ~/.config/localbridge contract shared
+# by init.sh and the bootstrap docs. Render with a fixture HOME so the
+# assert is host-independent.
+mkdir -p "$T/fakehome"
+HOME="$T/fakehome" timeout 120 docker compose -p "$CPROJ" -f docker-compose.yml config > "$T/cfg-base.txt" 2>&1 || fail "base config render"
+grep -qxF "    file: $T/fakehome/.config/localbridge/openai_tunnel_id" "$T/cfg-base.txt" || fail "default tunnel_id ref off-contract"
+grep -qxF "    file: $T/fakehome/.config/localbridge/openai_api_key" "$T/cfg-base.txt" || fail "default api_key ref off-contract"
+echo "== workflow-static"
+# Cheap static asserts on the CI workflow (Reviewer verifies by read
+# where cheap checks stop): strict glob, scoped cache, max provenance,
+# semver gate presence.
+grep -q '"v\[0-9\]\*"' .github/workflows/build.yml || fail "workflow glob"
+grep -q "scope=localbridge" .github/workflows/build.yml || fail "workflow cache scope"
+grep -q "provenance: mode=max" .github/workflows/build.yml || fail "workflow provenance"
+# Full strict semver gate (not just the refs/tags/v prefix): the
+# workflow must carry the ^v[0-9]+\.[0-9]+\.[0-9]+$ verdict itself.
+grep -qF '^v[0-9]+\.[0-9]+\.[0-9]+$' .github/workflows/build.yml || fail "workflow semver gate"
 echo "== root-model"
 # Rootless primary model: container UID 0 (maps to the host operator,
 # not host root). Repo + operator-owned 0400 secrets readable as root;
 # cache volume writable as root.
 [ "$(timeout 120 docker run --rm --user 0:0 "$IMAGE" id -u)" = "0" ] || fail "euid 0 in-container"
 timeout 120 docker run --rm --read-only --tmpfs /tmp --user 0:0 -v "$WS:/workspace:ro" "$IMAGE" sh -c 'test -r /workspace/file.txt' || fail "repo readable as root"
-timeout 120 docker run --rm --user 0:0 -v "$C2S:/run/secrets:ro" "$IMAGE" sh -c 'test -r /run/secrets/tunnel_id && test -r /run/secrets/api_key' || fail "secrets readable as root"
+timeout 120 docker run --rm --user 0:0 -v "$C2S:/run/secrets:ro" "$IMAGE" sh -c 'test -r /run/secrets/openai_tunnel_id && test -r /run/secrets/openai_api_key' || fail "secrets readable as root"
 timeout 120 docker run --rm --user 0:0 -v "$V_NPM:/var/lib/mcp/npm" "$IMAGE" sh -c 'touch /var/lib/mcp/npm/rootw' || fail "cache writable as root"
 echo "== compose-file-presence"
 # Entrypoint performs NO mapping now (single-owner Go): _FILE lines pass
@@ -436,7 +465,7 @@ timeout 120 docker run --rm --read-only --tmpfs /tmp -v "$(pwd):/workspace:ro" "
 echo "== compose-readability"
 # Mounted fakes readable as container root (compose user 0:0 model).
 timeout 120 docker run --rm --user 0:0 -v "$C2S:/run/secrets:ro" \
-	-e OPENAI_TUNNEL_ID_FILE=/run/secrets/tunnel_id -e OPENAI_API_KEY_FILE=/run/secrets/api_key \
+	-e OPENAI_TUNNEL_ID_FILE=/run/secrets/openai_tunnel_id -e OPENAI_API_KEY_FILE=/run/secrets/openai_api_key \
 	"$IMAGE" sh -c 'test -r "$OPENAI_TUNNEL_ID_FILE" && test -r "$OPENAI_API_KEY_FILE"' || fail "secrets unreadable as root"
 echo "== compose-direct-env"
 mkovempty "$C2S" "      OPENAI_TUNNEL_ID: direct1
@@ -449,6 +478,14 @@ mkovempty "$C2S"
 c2up "$T/nenv.txt" || fail "negative run"
 if grep -q "^OPENAI_TUNNEL_ID=" "$T/nenv.txt"; then
 	fail "mapping absence leaked"
+fi
+echo "== compose-missing-secret"
+# RED validation path with ZERO file creation: override points at a
+# path nothing ever creates — mount refusal must fail the row (never
+# provisioned, never touched).
+mkoverride "$T/does-not-exist"
+if c2up "$T/missing.txt"; then
+	fail "missing secret file must refuse"
 fi
 echo "== compose-hygiene"
 [ -z "$(find . -path ./.devenv -prune -o -name '*.example' -print)" ] || fail "*.example files present"

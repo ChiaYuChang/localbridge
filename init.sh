@@ -23,18 +23,30 @@ command -v python3 >/dev/null 2>&1 || fail "python3 missing (host-side prefetch 
 echo "host: $(npx --version 2>/dev/null || echo 'npx-unavailable') / $(python3 --version 2>&1)"
 
 # ---- secrets bootstrap (HOME only, invoking user owns everything) ----
-SECDIR="$HOME/Private/secrets/openai_tunnel"
+# Secret home: ~/.config/localbridge/ (single location shared by
+# compose refs, docs, and proof contract). Dir 0700, files 0400,
+# owner == invoking UID (verify-not-chown kept).
+SECDIR="$HOME/.config/localbridge"
 mkdir -p "$SECDIR"
-for f in tunnel_id api_key; do
+chmod 0700 "$SECDIR"
+[ "$(stat -c %a "$SECDIR")" = "700" ] || fail "mode of $SECDIR must be 0700"
+for f in openai_tunnel_id openai_api_key; do
 	if [ ! -e "$SECDIR/$f" ]; then
-		: > "$SECDIR/$f"
-		chmod 0400 "$SECDIR/$f"
-		echo "created empty placeholder: $SECDIR/$f (fill in your value)"
+		cat >&2 <<EOF
+missing $SECDIR/$f — create it yourself and set mode 0400.
+EOF
+		exit 1
+	fi
+	# Regular-file gate (a directory named like a secret must fail
+	# closed, not validate green).
+	if [ ! -f "$SECDIR/$f" ]; then
+		echo "not a regular file: $SECDIR/$f" >&2
+		exit 1
 	fi
 	[ "$(stat -c %u "$SECDIR/$f")" = "$(id -u)" ] || fail "owner of $SECDIR/$f must equal invoking UID"
 	[ "$(stat -c %a "$SECDIR/$f")" = "400" ] || fail "mode of $SECDIR/$f must be 0400"
 done
-echo "secrets dir OK: $SECDIR (owner + 0400 verified, never chowned)"
+echo "secrets dir OK: $SECDIR (dir 0700, owner + 0400 verified, never chowned)"
 
 # ---- prefetch for host-side runs (Phase 2a cache; warn-only offline) ----
 # NOTE: --help is consumed as a directory arg (server starts, rejects
@@ -53,7 +65,7 @@ fi
 # ---- next steps ----
 cat <<'EOF'
 next steps:
-  1. Fill ~/Private/secrets/openai_tunnel/{tunnel_id,api_key} with real values (keep 0400).
+  1. Create + fill ~/.config/localbridge/{openai_tunnel_id,openai_api_key} if missing, keep 0400 (see above).
   2. Rebuild + prove: docker build -t localbridge:plan -f Dockerfile . && sh scripts/container-proof.sh localbridge:plan
   3. Live sweep: docker compose up -d, connect the tunnel, call each forwarded tool via the online agent.
 EOF

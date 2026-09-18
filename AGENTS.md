@@ -64,9 +64,9 @@
 
 ## Active State & In-Flight Context
 
-- **Observed-At**: `2026-09-19T02:01:33Z - test(proxy) sealed; phase2a candidate unsealed (seal pending)`
-- **Dirty Status**: `dirty (phase2a driver unsealed; IMPLEMENTATION_REVIEW_PASS; SCAN pending)`
+- **Observed-At**: `2026-09-19T05:51:17Z - fix-forward incl validate-only pivot unsealed (seal pending)`
+- **Dirty Status**: `dirty (secret-home + CI + validate-only unsealed; IMPLEMENTATION_REVIEW_PASS hardened; DEFEND_PASS; SCAN pending)`
 - **Milestone**: `COMMIT_FLOW_STEP_7 - seal message presented, awaiting auth`
-- **Next Pickup Item**: `User auth (ok) -> jj commit; then Phase 2b container+online live sweep`
+- **Next Pickup Item**: `User auth (ok) -> jj commit (local only, no push); retro-gates close on seal`
 - **Commit Ordering Rule**: All `AGENTS.md` content updates land PRE-seal. `Observed-At` carries timestamp + sealed message only, never commit hashes (hashes mutate on squash and live authoritatively in `jj log`); no post-seal squash cycle exists.
 - **Ground Truth Revalidation Invariant**: Cold-start Planners MUST run fresh VCS status/log inspection; never trust cached Active State.
