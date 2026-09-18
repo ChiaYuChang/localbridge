@@ -51,7 +51,6 @@ cleanup() {
 	else
 		rm -rf "$T"
 	fi
-	rmdir ./repo 2>/dev/null || true
 	docker rm -f "$REAP_C" "$CANARY_C" >/dev/null 2>&1 || true
 	if [ -n "$C2OVERRIDE" ]; then
 		docker compose -p "$CPROJ" -f docker-compose.yml -f "$C2OVERRIDE" rm -sf gateway >/dev/null 2>&1 || true
@@ -69,7 +68,12 @@ DFLAGS="--rm --read-only --tmpfs /tmp -v $WS:/workspace:ro -v $V_NPM:/var/lib/mc
 # NOTE: the git repo lives AT /workspace itself: safe.directory matches
 # exact paths only (verified: a bare /workspace entry does NOT cover
 # /workspace/subdir), and the trust line is frozen to exactly that value.
+# Fixtures build under HOME=<tmpdir> so operator dotfiles (git/jj
+# identity, templates) can never leak into fixture repos.
 mkdir -p "$WS"
+OLDHOME=$HOME
+export HOME="$T/home"
+mkdir -p "$HOME"
 git -C "$WS" init -q
 git -C "$WS" -c user.email=t@t.t -c user.name=t -c commit.gpgsign=false commit -q --allow-empty -m init
 printf 'v1\n' > "$WS/file.txt"
@@ -84,6 +88,7 @@ printf 'alpha\n' > "$WS/jjrepo/a.txt"
 jj -R "$WS/jjrepo" describe -m fixture >/dev/null 2>&1
 printf 'alpha\nmore\n' > "$WS/jjrepo/a.txt"
 jj -R "$WS/jjrepo" st >/dev/null 2>&1
+export HOME="$OLDHOME"
 
 # World-readable fixtures (host UID ownership retained for the
 # ownership proof; container UID 10001 only needs read traversal).
@@ -118,7 +123,7 @@ docker history --no-trunc "$IMAGE" > "$T/history.txt"
 python3 - "$T/history.txt" <<'EOF' || fail "history-scan"
 import sys
 text = open(sys.argv[1]).read()
-for marker in ["CONTROL_PLANE_API_KEY", "OPENAI_API_KEY", "/root/.ssh", ".secrets", "id_rsa", "id_ed25519"]:
+for marker in ["CONTROL_PLANE_API_KEY", "OPENAI_API_KEY", "OPENAI_TUNNEL_ID", "/root/.ssh", "id_rsa", "id_ed25519"]:
     if marker in text:
         print("leaked marker in history: " + marker)
         sys.exit(1)
@@ -144,7 +149,7 @@ cat "$SMOKE_OUT"
 # (creds never supplied; serving out of scope).
 [ "$SMOKE_CODE" -ne 124 ] || fail "smoke hung (timeout kill)"
 [ "$SMOKE_CODE" -eq 1 ] || fail "smoke exit $SMOKE_CODE, want config-error 1"
-grep -q "CONTROL_PLANE_TUNNEL_ID" "$SMOKE_OUT" || fail "smoke output missing config complaint"
+grep -q "OPENAI_TUNNEL_ID" "$SMOKE_OUT" || fail "smoke output missing config complaint"
 
 # ---- 6. parsed versions (git >= 2.41, jj == 0.41.0-prefix exact) ----
 echo "== versions"
@@ -223,6 +228,20 @@ if timeout 120 docker run --rm --read-only --tmpfs /tmp --entrypoint sh -v "$WS:
 	fail "untrusted git status unexpectedly succeeded"
 fi
 
+# ---- 8b. workspace + env hardening rows ----
+echo "== workspace-secrets-absent"
+# No in-repo secrets: the operator dir lives outside the repo, so the
+# mounted workspace must not contain a .secrets tree at all.
+timeout 120 docker run $DFLAGS "$IMAGE" sh -c 'test ! -e /workspace/.secrets' || fail "/workspace/.secrets present"
+echo "== baseline-git"
+# Baseline env only (no GIT_CONFIG_* anywhere — empty is not unset for
+# git, so assert true absence): git discovers the HOME-default trust
+# file implicitly — no overrides needed.
+timeout 120 docker run $DFLAGS "$IMAGE" sh -c 'git -C /workspace status >/dev/null && ! env | grep -q "^GIT_CONFIG"' || fail "baseline git"
+echo "== cache-uid"
+# Cache dirs writable as the fixed UID (explicit, not just implied).
+timeout 120 docker run $DFLAGS "$IMAGE" sh -c '[ "$(id -u)" = "10001" ] && touch /var/lib/mcp/npm/u /var/lib/mcp/uv/u /var/lib/mcp/pipx/u' || fail "cache writable as 10001"
+
 # ---- 9. frozen diff-argv canary (external driver must NOT run) ----
 # Rationale: external diff drivers execute without a TTY, so the canary
 # is non-vacuous (removing --no-ext-diff flips it). core.pager /
@@ -269,11 +288,14 @@ timeout 120 docker stop -t 5 "$REAP_C" >/dev/null || fail "stop hung"
 # ---- 12. runtime sentinels (never shipped / never present) ----
 echo "== sentinels"
 timeout 120 docker run $DFLAGS "$IMAGE" sh -c 'test ! -e scripts && test ! -e /root/.ssh && test ! -e /tmp/lr-proof' || fail "shipped paths present"
-if timeout 120 docker run $DFLAGS "$IMAGE" env | grep -i "CONTROL_PLANE" >/dev/null 2>&1; then
+if timeout 120 docker run $DFLAGS "$IMAGE" env | grep -E "OPENAI_TUNNEL_ID|OPENAI_API_KEY" >/dev/null 2>&1; then
 	fail "secret in runtime env"
 fi
 
 # ---- 13. compose rows (C2: Docker-secrets delivery, no real creds) ----
+# Mapping lives in Go config parsing now (cmd matrix proves it); these
+# rows prove DELIVERY: files mounted readable, _FILE passthrough
+# untouched by the entrypoint, direct env exact, absence clean.
 echo "== compose-config"
 # Fresh compose project per run (fresh network/volume names). Image
 # pinned via LOCAL_MCP_IMAGE + presence-gated, so no row ever builds
@@ -281,21 +303,17 @@ echo "== compose-config"
 CPROJ="c2proof$$"
 # Temp fixtures WITHOUT host sudo: container-root helper chowns the
 # bind-mounted temp dir (documents the no-sudo path). NEVER repo
-# ./secrets (no repo residue; $T cleanup via trap).
+# .secrets (no repo residue; $T cleanup via trap).
 C2S="$T/c2secrets"
 mkdir -p "$C2S"
 printf 'tid-123\n' > "$C2S/tunnel_id"
 printf '  spaced-key  \n' > "$C2S/api_key"
 timeout 120 docker run --rm --user 0 --entrypoint sh -v "$C2S:/w" "$IMAGE" -c 'chown 10001:10001 /w/tunnel_id /w/api_key && chmod 0400 /w/tunnel_id /w/api_key' || fail "secret fixture chown"
 [ "$(stat -c %u:%a "$C2S/tunnel_id")" = "10001:400" ] || fail "fixture perms"
-# Daemon auto-creates missing bind sources (root-owned): pre-create the
-# ./repo bind target ourselves so the run leaves zero residue; trap
-# removes it (ro mount, nothing ever writes there).
-mkdir -p repo
 mkoverride() {
 	# $1 = secrets dir; $2 = extra environment YAML lines (optional).
-	# Command is ALWAYS ["env"]: every compose row asserts env output
-	# or entrypoint errors via up/logs (no `run` anywhere).
+	# Command is ALWAYS ["env"]: rows assert env output via up/logs
+	# (no `run` anywhere).
 	cat > "$T/override.yml" <<EOF
 services:
   gateway:
@@ -305,7 +323,7 @@ ${2:-}
 secrets:
   tunnel_id:
     file: $1/tunnel_id
-  control_plane_api_key:
+  api_key:
     file: $1/api_key
 EOF
 	C2OVERRIDE="$T/override.yml"
@@ -319,13 +337,13 @@ services:
     image: ${LOCAL_MCP_IMAGE:-local-mcp}
     command: ["env"]
     environment:
-      CONTROL_PLANE_TUNNEL_ID_FILE: ""
-      CONTROL_PLANE_API_KEY_FILE: ""
+      OPENAI_TUNNEL_ID_FILE: ""
+      OPENAI_API_KEY_FILE: ""
 ${2:-}
 secrets:
   tunnel_id:
     file: $1/tunnel_id
-  control_plane_api_key:
+  api_key:
     file: $1/api_key
 EOF
 	C2OVERRIDE="$T/override-empty.yml"
@@ -354,88 +372,46 @@ mkoverride "$C2S"
 timeout 120 docker compose -p "$CPROJ" -f docker-compose.yml -f "$T/override.yml" config > "$T/cfg.txt" 2>&1 || fail "compose config"
 grep -q "image: $IMAGE" "$T/cfg.txt" || fail "image pin"
 docker image inspect "$IMAGE" >/dev/null || fail "pinned image missing"
-echo "== compose-mapping"
+echo "== compose-file-presence"
+# Entrypoint performs NO mapping now (single-owner Go): _FILE lines pass
+# through verbatim; direct secret vars stay absent.
 c2up "$T/cenv.txt" || fail "compose up"
-grep -qxF "CONTROL_PLANE_TUNNEL_ID=tid-123" "$T/cenv.txt" || fail "tunnel_id mapping (CR/LF trim)"
-grep -qxF "CONTROL_PLANE_API_KEY=  spaced-key  " "$T/cenv.txt" || fail "api_key mapping (spaces preserved)"
-if grep -q "_FILE=" "$T/cenv.txt"; then
-	fail "_FILE residue post-mapping"
+grep -qxF "OPENAI_TUNNEL_ID_FILE=/run/secrets/tunnel_id" "$T/cenv.txt" || fail "tunnel _FILE passthrough"
+grep -qxF "OPENAI_API_KEY_FILE=/run/secrets/api_key" "$T/cenv.txt" || fail "api _FILE passthrough"
+if grep -q "^OPENAI_TUNNEL_ID=" "$T/cenv.txt" || grep -q "^OPENAI_API_KEY=" "$T/cenv.txt"; then
+	fail "entrypoint mapped credentials (single-owner violation)"
 fi
 echo "== compose-caches"
 for kv in "npm_config_cache=/var/lib/mcp/npm" "UV_CACHE_DIR=/var/lib/mcp/uv" "PIPX_HOME=/var/lib/mcp/pipx" "PIPX_BIN_DIR=/var/lib/mcp/pipx/bin" "HOME=/tmp"; do
 	grep -qxF "$kv" "$T/cenv.txt" || fail "cache env $kv"
 done
-echo "== compose-file-wins"
-mkoverride "$C2S" "    environment:
-      CONTROL_PLANE_TUNNEL_ID: direct1
-      CONTROL_PLANE_API_KEY: direct2"
-if ! c2up "$T/fw.txt"; then
-	fail "file-wins run"
-fi
-grep -qxF "CONTROL_PLANE_TUNNEL_ID=tid-123" "$T/fw.txt" || fail "file must win for id"
-grep -qxF "CONTROL_PLANE_API_KEY=  spaced-key  " "$T/fw.txt" || fail "file must win for key"
-if grep -q "direct1" "$T/fw.txt" || grep -q "direct2" "$T/fw.txt"; then
-	fail "direct values leaked past file-wins"
-fi
+echo "== compose-readability"
+# Mounted fakes readable as the container user (mcp, not root).
+timeout 120 docker run --rm -v "$C2S:/run/secrets:ro" \
+	-e OPENAI_TUNNEL_ID_FILE=/run/secrets/tunnel_id -e OPENAI_API_KEY_FILE=/run/secrets/api_key \
+	"$IMAGE" sh -c 'test -r "$OPENAI_TUNNEL_ID_FILE" && test -r "$OPENAI_API_KEY_FILE"' || fail "secrets unreadable as container user"
 echo "== compose-direct-env"
-mkovempty "$C2S" "      CONTROL_PLANE_TUNNEL_ID: direct1
-      CONTROL_PLANE_API_KEY: direct2"
+mkovempty "$C2S" "      OPENAI_TUNNEL_ID: direct1
+      OPENAI_API_KEY: direct2"
 c2up "$T/denv.txt" || fail "direct run"
-grep -qxF "CONTROL_PLANE_TUNNEL_ID=direct1" "$T/denv.txt" || fail "direct passthrough id"
-grep -qxF "CONTROL_PLANE_API_KEY=direct2" "$T/denv.txt" || fail "direct passthrough key"
+grep -qxF "OPENAI_TUNNEL_ID=direct1" "$T/denv.txt" || fail "direct passthrough id"
+grep -qxF "OPENAI_API_KEY=direct2" "$T/denv.txt" || fail "direct passthrough key"
 echo "== compose-negative"
 mkovempty "$C2S"
 c2up "$T/nenv.txt" || fail "negative run"
-if grep -q "^CONTROL_PLANE_TUNNEL_ID=" "$T/nenv.txt"; then
+if grep -q "^OPENAI_TUNNEL_ID=" "$T/nenv.txt"; then
 	fail "mapping absence leaked"
 fi
-echo "== compose-bad-fixtures"
-mkbad() {
-	# $1 = subdir, $2..$3 = tunnel_id/api_key bytes (printf %b).
-	mkdir -p "$T/c2bad/$1"
-	printf "%b" "$2" > "$T/c2bad/$1/tunnel_id"
-	printf "%b" "$3" > "$T/c2bad/$1/api_key"
-	timeout 120 docker run --rm --user 0 --entrypoint sh -v "$T/c2bad/$1:/w" "$IMAGE" -c 'chown 10001:10001 /w/* && chmod 0400 /w/*' || fail "bad fixture chown $1"
-	mkoverride "$T/c2bad/$1"
-}
-mkbad ws-only '   ' 'valid-key'
-if c2up "$T/ws.txt"; then
-	fail "whitespace-only must refuse"
-fi
-grep -q "CONTROL_PLANE_TUNNEL_ID" "$T/ws.txt" || fail "whitespace error must name var"
-mkbad empty '' 'valid-key'
-if c2up "$T/empty.txt"; then
-	fail "empty must refuse"
-fi
-grep -q "CONTROL_PLANE_TUNNEL_ID" "$T/empty.txt" || fail "empty error must name var"
-mkbad cronly 'tok-cr\r' 'valid-key'
-c2up "$T/cr.txt" || fail "CR-only run"
-grep -qxF "CONTROL_PLANE_TUNNEL_ID=tok-cr" "$T/cr.txt" || fail "CR-only trim"
-mkdir -p "$T/c2bad/perm"
-printf 'valid-key' > "$T/c2bad/perm/api_key"
-printf 'denied-key' > "$T/c2bad/perm/tunnel_id"
-chmod 000 "$T/c2bad/perm/tunnel_id"
-timeout 120 docker run --rm --user 0 --entrypoint sh -v "$T/c2bad/perm:/w" "$IMAGE" -c 'chown 10001:10001 /w/api_key && chmod 0400 /w/api_key' || fail "perm fixture chown"
-mkoverride "$T/c2bad/perm"
-if c2up "$T/perm.txt"; then
-	fail "unreadable must refuse"
-fi
-grep -q "tunnel_id" "$T/perm.txt" || fail "permission error must name path"
-mkdir -p "$T/c2bad/missing"
-printf 'valid-key' > "$T/c2bad/missing/api_key"
-timeout 120 docker run --rm --user 0 --entrypoint sh -v "$T/c2bad/missing:/w" "$IMAGE" -c 'chown 10001:10001 /w/* && chmod 0400 /w/*' || fail "missing fixture chown"
-mkoverride "$T/c2bad/missing"
-if c2up "$T/missing.txt"; then
-	fail "missing file must refuse"
-fi
-grep -q "missing" "$T/missing.txt" || fail "missing error must name path"
 echo "== compose-hygiene"
 [ -z "$(find . -path ./.devenv -prune -o -name '*.example' -print)" ] || fail "*.example files present"
-grep -qxF "secrets/" .gitignore || fail ".gitignore lacks secrets/"
-grep -qxF "secrets/" .dockerignore || fail ".dockerignore lacks secrets/"
-if [ -d ./secrets ]; then
-	[ -z "$(ls -A ./secrets | grep -v '^.gitkeep$')" ] || fail "secrets/ holds more than .gitkeep"
+if grep -qxF "secrets/" .gitignore || grep -qxF "secrets/" .dockerignore || grep -qxF ".secrets/" .gitignore || grep -qxF ".secrets/" .dockerignore; then
+	fail "stale secrets ignore present (no in-repo secrets)"
 fi
+# Tracked subset: operator-local secret files are untracked by design;
+# the only trackable member is .gitkeep (placeholder).
+tracked=$(jj --no-pager file list 2>/dev/null | grep "\.secrets/" || true)
+bad=$(printf '%s\n' "$tracked" | grep -v "\.secrets/\.gitkeep$" || true)
+[ -z "$bad" ] || fail "tracked secrets beyond .gitkeep: $bad"
 echo "== compose-teardown"
 timeout 120 docker compose -p "$CPROJ" -f docker-compose.yml -f "$T/override.yml" down -v >/dev/null || fail "compose down"
 

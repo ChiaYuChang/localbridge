@@ -199,7 +199,7 @@ func TestBuildEnv(t *testing.T) {
 	t.Setenv("TZ", "UTC")
 	t.Setenv("LANG", "C.UTF-8")
 	t.Setenv("LC_ALL", "C.UTF-8")
-	t.Setenv("CONTROL_PLANE_API_KEY", "planted")
+	t.Setenv("OPENAI_TUNNEL_ID", "planted")
 	t.Setenv("OPENAI_API_KEY", "planted")
 	t.Setenv("UNLISTED_VAR", "planted")
 
@@ -221,7 +221,7 @@ func TestBuildEnv(t *testing.T) {
 	for _, g := range got {
 		k, _, _ := strings.Cut(g, "=")
 		switch {
-		case strings.HasPrefix(k, "CONTROL_PLANE_"), strings.HasPrefix(k, "OPENAI_"):
+		case strings.HasPrefix(k, "OPENAI_"):
 			t.Errorf("secret leaked into child env: %q", g)
 		case k == "UNLISTED_VAR", k == "MALFORMED-ENTRY":
 			t.Errorf("non-baseline leaked: %q", g)

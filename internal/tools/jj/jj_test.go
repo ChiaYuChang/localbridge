@@ -140,16 +140,16 @@ func TestNewJJ_EnvRequired(t *testing.T) {
 func TestNewJJ_EnvCopiedAndExplicit(t *testing.T) {
 	// Copy semantics: caller post-mutation cannot affect children.
 	// Absence: planted secrets never enter the stored env.
-	t.Setenv("CONTROL_PLANE_API_KEY", "planted")
-	env := []string{"A=1", "CONTROL_PLANE_API_KEY=explicit"}
+	t.Setenv("OPENAI_API_KEY", "planted")
+	env := []string{"A=1", "OPENAI_API_KEY=explicit"}
 	j, err := newJJWithBin(t.TempDir(), fixtureBin(t), time.Second, env)
 	if err != nil {
 		t.Fatal(err)
 	}
 	env[0] = "A=MUT"
-	env[1] = "CONTROL_PLANE_API_KEY=MUT"
+	env[1] = "OPENAI_API_KEY=MUT"
 	got := j.Environ()
-	if len(got) != 2 || got[0] != "A=1" || got[1] != "CONTROL_PLANE_API_KEY=explicit" {
+	if len(got) != 2 || got[0] != "A=1" || got[1] != "OPENAI_API_KEY=explicit" {
 		t.Fatalf("stored env must be a copy: %q", got)
 	}
 	j2, err := newJJWithBin(t.TempDir(), fixtureBin(t), time.Second, []string{"A=1"})
@@ -157,7 +157,7 @@ func TestNewJJ_EnvCopiedAndExplicit(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, kv := range j2.Environ() {
-		if strings.HasPrefix(kv, "CONTROL_PLANE_API_KEY=") {
+		if strings.HasPrefix(kv, "OPENAI_API_KEY=") {
 			t.Fatalf("ambient secret inherited: %q", kv)
 		}
 	}

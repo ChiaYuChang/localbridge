@@ -175,7 +175,7 @@ func SelectActive(cfg GatewayConfig, active []string) []string {
 
 // envBaseline is the FROZEN child-env allowlist: copied from the process
 // environment when present, never synthesized when absent. Secrets
-// (CONTROL_PLANE_API_KEY and friends) are NEVER in the baseline.
+// (OPENAI_TUNNEL_ID, OPENAI_API_KEY and friends) are NEVER in the baseline.
 var envBaseline = []string{"PATH", "HOME", "TMPDIR", "TEMP", "TMP", "TZ", "LANG", "LC_ALL"}
 
 // BuildEnv builds a child environment: baseline keys passed through from

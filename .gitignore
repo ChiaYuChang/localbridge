@@ -6,9 +6,5 @@ devenv.local.yaml
 # env
 .env
 
-# pre-commit
-.pre-commit-config.yaml
-
-# secrets
-.secrets
-secrets/
+# secrets (insurance: dir absent; blocks accidental commit if recreated)
+.secrets/

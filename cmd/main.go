@@ -145,32 +145,65 @@ func run(ctx context.Context, configPath string, profiles []string) error {
 	}
 }
 
-func configFromEnvironment() (tunnelclient.Config, error) {
-	tunnelID := strings.TrimSpace(os.Getenv("CONTROL_PLANE_TUNNEL_ID"))
-	if tunnelID == "" {
-		return tunnelclient.Config{}, errors.New("CONTROL_PLANE_TUNNEL_ID is required")
+// resolveCredential is the SINGLE OWNER of _FILE resolution for the two
+// secrets: TUNNEL_ID = OPENAI_TUNNEL_ID_FILE > OPENAI_TUNNEL_ID (no third
+// fallback); API key = OPENAI_API_KEY_FILE > OPENAI_API_KEY (the general
+// OpenAI key, also authorizing tunnel — no separate tunnel key, no
+// CONTROL_PLANE_*). Read file → unreadable/missing hard error naming
+// path → trim trailing CR/LF only → empty/whitespace-only hard error
+// naming var → file wins → os.Unsetenv the _FILE var after successful
+// read so child processes never inherit file paths.
+func resolveCredential(envVar, fileVar string) (string, error) {
+	path := strings.TrimSpace(os.Getenv(fileVar))
+	if path == "" {
+		return strings.TrimSpace(os.Getenv(envVar)), nil
 	}
-	apiKey := strings.TrimSpace(os.Getenv("CONTROL_PLANE_API_KEY"))
-	if apiKey == "" {
-		apiKey = strings.TrimSpace(os.Getenv("OPENAI_API_KEY"))
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "", fmt.Errorf("invalid %s file %q: %w", fileVar, path, err)
 	}
-	if apiKey == "" {
-		return tunnelclient.Config{}, errors.New("CONTROL_PLANE_API_KEY or OPENAI_API_KEY is required")
+	value := strings.TrimRight(string(data), "\r\n")
+	if value == "" {
+		return "", fmt.Errorf("invalid %s file %q: empty credential", fileVar, path)
 	}
+	if strings.TrimSpace(value) == "" {
+		return "", fmt.Errorf("invalid %s file %q: whitespace-only credential", fileVar, path)
+	}
+	if err := os.Unsetenv(fileVar); err != nil {
+		return "", fmt.Errorf("invalid %s file %q: %w", fileVar, path, err)
+	}
+	return value, nil
+}
 
-	pollTimeout, err := durationFromEnvironment("CONTROL_PLANE_POLL_TIMEOUT")
+func configFromEnvironment() (tunnelclient.Config, error) {
+	tunnelID, err := resolveCredential("OPENAI_TUNNEL_ID", "OPENAI_TUNNEL_ID_FILE")
 	if err != nil {
 		return tunnelclient.Config{}, err
 	}
-	extraHeaders, err := headersFromEnvironment("CONTROL_PLANE_EXTRA_HEADERS")
+	if tunnelID == "" {
+		return tunnelclient.Config{}, errors.New("OPENAI_TUNNEL_ID is required")
+	}
+	apiKey, err := resolveCredential("OPENAI_API_KEY", "OPENAI_API_KEY_FILE")
+	if err != nil {
+		return tunnelclient.Config{}, err
+	}
+	if apiKey == "" {
+		return tunnelclient.Config{}, errors.New("OPENAI_API_KEY is required")
+	}
+
+	pollTimeout, err := durationFromEnvironment("OPENAI_TUNNEL_POLL_TIMEOUT")
+	if err != nil {
+		return tunnelclient.Config{}, err
+	}
+	extraHeaders, err := headersFromEnvironment("OPENAI_TUNNEL_EXTRA_HEADERS")
 	if err != nil {
 		return tunnelclient.Config{}, err
 	}
 	return tunnelclient.Config{
 		TunnelID:                 tunnelID,
 		APIKey:                   apiKey,
-		ControlPlaneBaseURL:      os.Getenv("CONTROL_PLANE_BASE_URL"),
-		OrganizationID:           os.Getenv("CONTROL_PLANE_ORGANIZATION_ID"),
+		ControlPlaneBaseURL:      os.Getenv("OPENAI_TUNNEL_BASE_URL"),
+		OrganizationID:           os.Getenv("OPENAI_TUNNEL_ORGANIZATION_ID"),
 		ControlPlaneExtraHeaders: extraHeaders,
 		PollTimeout:              pollTimeout,
 	}, nil

@@ -1,7 +1,6 @@
 .git
 .jj
-.secrets
-secrets/
+.secrets/
 .devenv/
 devenv.yaml
 devenv.nix

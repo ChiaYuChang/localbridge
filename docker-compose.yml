@@ -4,7 +4,11 @@
 # operator-trusted; secrets/env-sanitation prevent ACCIDENTAL propagation
 # only, never malicious same-container credential access (file-backed
 # compose secrets remain readable in-container; hard isolation would need
-# a stronger process/container boundary).
+# a stronger process/container boundary). No in-repo secrets: operator
+# credentials live OUTSIDE the repo (see bootstrap); direct-env fallback
+# is a non-Compose contract (documented here, never a compose path).
+# The single cache volume is shared trust state across runs — reset it
+# explicitly (`docker compose down -v`) when a clean cache is required.
 #
 # This file itself is TRUSTED input: `file:` refs read host files at
 # config-processing time. Never presented as a sandbox.
@@ -21,18 +25,15 @@ services:
     tmpfs:
       - /tmp
     volumes:
-      # Replace with a real repo path. Default "." is the build context,
-      # NOT a real workspace (fail-loud: serving repo code as workspace
-      # is almost certainly a mistake — set this deliberately).
-      - ./repo:/workspace:ro
-      - npm-cache:/var/lib/mcp/npm
-      - uv-cache:/var/lib/mcp/uv
-      - pipx-cache:/var/lib/mcp/pipx
+      # Repo root mounts directly (absolute target; relative-target form
+      # rejected).
+      - .:/workspace:ro
+      - cache:/var/lib/mcp
     environment:
-      # Docker-secrets delivery (entrypoint maps _FILE -> var, then
-      # unsets _FILE; direct env preserved when _FILE absent).
-      CONTROL_PLANE_TUNNEL_ID_FILE: /run/secrets/tunnel_id
-      CONTROL_PLANE_API_KEY_FILE: /run/secrets/control_plane_api_key
+      # Docker-secrets delivery (Go resolves _FILE -> var, then unsets
+      # _FILE; direct env preserved when _FILE absent).
+      OPENAI_TUNNEL_ID_FILE: /run/secrets/tunnel_id
+      OPENAI_API_KEY_FILE: /run/secrets/api_key
       # Runner caches (frozen values so G1-sanitized children keep
       # runners functional; PIPX_BIN_DIR/HOME choice documented: HOME is
       # /tmp per image contract, binaries land via explicit env below).
@@ -43,19 +44,20 @@ services:
       HOME: /tmp
     secrets:
       - tunnel_id
-      - control_plane_api_key
+      - api_key
     # NO restart key (short-lived design; daemon behavior via user
     # override file, never default). NO ports (tunnel-attached only).
     #
     # SECRET BOOTSTRAP (root/sudo REQUIRED for the chown — stated
-    # explicitly, no silent assumption). NEVER commit (gitignored). No
-    # `.example` secret files (example secrets invite accidents — docs
-    # show printf commands instead):
-    #   mkdir -p secrets
-    #   printf %s "$TUNNEL_ID" > secrets/tunnel_id
-    #   printf %s "$API_KEY" > secrets/api_key
-    #   sudo chown 10001:10001 secrets/tunnel_id secrets/api_key
-    #   chmod 0400 secrets/tunnel_id secrets/api_key
+    # explicitly, no silent assumption; rootful-only: the chown/chmod
+    # below need privilege, there is no rootless bootstrap path).
+    # NEVER commit. No `.example` secret files (example secrets invite
+    # accidents — docs show printf commands instead):
+    #   mkdir -p ~/Private/secrets/openai_tunnel
+    #   printf %s "$TUNNEL_ID" > ~/Private/secrets/openai_tunnel/tunnel_id
+    #   printf %s "$API_KEY" > ~/Private/secrets/openai_tunnel/api_key
+    #   sudo chown 10001:10001 ~/Private/secrets/openai_tunnel/tunnel_id ~/Private/secrets/openai_tunnel/api_key
+    #   chmod 0400 ~/Private/secrets/openai_tunnel/tunnel_id ~/Private/secrets/openai_tunnel/api_key
     # Compose file-backed secrets preserve host ownership/mode
     # (`uid`/`gid`/`mode` keys are IGNORED locally with a warning);
     # without the chown the fixed `USER mcp` gets Permission denied
@@ -63,11 +65,9 @@ services:
 
 secrets:
   tunnel_id:
-    file: ./secrets/tunnel_id
-  control_plane_api_key:
-    file: ./secrets/api_key
+    file: ${HOME}/Private/secrets/openai_tunnel/tunnel_id
+  api_key:
+    file: ${HOME}/Private/secrets/openai_tunnel/api_key
 
 volumes:
-  npm-cache:
-  uv-cache:
-  pipx-cache:
+  cache:

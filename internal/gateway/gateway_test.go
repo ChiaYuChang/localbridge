@@ -423,7 +423,7 @@ func TestSingletons(t *testing.T) {
 }
 
 func TestE2EChains(t *testing.T) {
-	t.Setenv("CONTROL_PLANE_API_KEY", "planted")
+	t.Setenv("OPENAI_TUNNEL_ID", "planted")
 	t.Setenv("OPENAI_API_KEY", "planted")
 	ws := fixtureWorkspace(t)
 	stubs := map[string]*fakeSession{"d": echoFake("d")}
@@ -454,12 +454,12 @@ func TestE2EChains(t *testing.T) {
 	}
 	// Planted creds absent from native children env.
 	for _, kv := range gw.git.Environ() {
-		if strings.HasPrefix(kv, "CONTROL_PLANE_API_KEY=") || strings.HasPrefix(kv, "OPENAI_API_KEY=") {
+		if strings.HasPrefix(kv, "OPENAI_TUNNEL_ID=") || strings.HasPrefix(kv, "OPENAI_API_KEY=") {
 			t.Fatalf("native git child inherits secret: %q", kv)
 		}
 	}
 	for _, kv := range gw.jj.Environ() {
-		if strings.HasPrefix(kv, "CONTROL_PLANE_API_KEY=") || strings.HasPrefix(kv, "OPENAI_API_KEY=") {
+		if strings.HasPrefix(kv, "OPENAI_TUNNEL_ID=") || strings.HasPrefix(kv, "OPENAI_API_KEY=") {
 			t.Fatalf("native jj child inherits secret: %q", kv)
 		}
 	}

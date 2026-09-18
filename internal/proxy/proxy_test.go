@@ -255,7 +255,7 @@ func TestOptionsValidation(t *testing.T) {
 // ---- env proof ----
 
 func TestEnvProof(t *testing.T) {
-	t.Setenv("CONTROL_PLANE_API_KEY", "planted")
+	t.Setenv("OPENAI_API_KEY", "planted")
 	extra := map[string]string{"PROXY_EXTRA": "1"}
 	s := dialStdioFake(t, "normal", extra, testOpts())
 	defer s.Close()
@@ -267,7 +267,7 @@ func TestEnvProof(t *testing.T) {
 		t.Fatalf("child env must EQUAL baseline+explicit:\n got=%q\nwant=%q", got, want)
 	}
 	for _, kv := range got {
-		if strings.HasPrefix(kv, "CONTROL_PLANE_API_KEY=") {
+		if strings.HasPrefix(kv, "OPENAI_API_KEY=") {
 			t.Fatalf("secret in child env: %q", kv)
 		}
 	}

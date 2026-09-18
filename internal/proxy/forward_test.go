@@ -447,7 +447,7 @@ func TestDownstreamErrorSanitized(t *testing.T) {
 	// Poison cause carries credentials + endpoint markers: text must
 	// contain NOTHING but the fixed shape.
 	st.onCall = func(*mcp.CallToolParams) (*mcp.CallToolResult, error) {
-		return nil, fmt.Errorf("dial https://x/sk-abcdefghijklmnop1234 cmd --key=AKIAIOSFODNN7EXAMPLE env CONTROL_PLANE_API_KEY: %w", ErrTransport)
+		return nil, fmt.Errorf("dial https://x/sk-abcdefghijklmnop1234 cmd --key=AKIAIOSFODNN7EXAMPLE env OPENAI_API_KEY: %w", ErrTransport)
 	}
 	p := mustProxy(t, []Downstream{{Name: "s", Session: st}}, h, nil)
 	_, err := p.CallTool(context.Background(), "s__o", nil)
@@ -457,7 +457,7 @@ func TestDownstreamErrorSanitized(t *testing.T) {
 	if err.Error() != `downstream "s" request failed` {
 		t.Fatalf("fixed shape violated: %q", err.Error())
 	}
-	for _, marker := range []string{"sk-abcdef", "AKIAIOS", "https://", "CONTROL_PLANE_API_KEY"} {
+	for _, marker := range []string{"sk-abcdef", "AKIAIOS", "https://", "OPENAI_API_KEY"} {
 		if strings.Contains(err.Error(), marker) {
 			t.Fatalf("cause leaked into text: %q", err.Error())
 		}
