@@ -64,9 +64,9 @@
 
 ## Active State & In-Flight Context
 
-- **Observed-At**: `2026-09-18T03:38:13Z - C1+path-deletion sealed (feat(container) @ vxswwykn)`
-- **Dirty Status**: `dirty (G4 gateway + AGENTS.md unsealed; SCAN_CLEAN; barrier pending)`
-- **Milestone**: `GATEWAY WIP - BLUEPRINT_PASS (reaffirmed); G1-G4 SUBPLAN_REVIEW_PASS; G5 tunnel E2E pending creds; commit flow Step 6`
+- **Observed-At**: `2026-09-18T20:41:12Z - C2 compose + proof unsealed (seal pending)`
+- **Dirty Status**: `dirty (C2 compose + AGENTS.md unsealed; SCAN_CLEAN; barrier pending)`
+- **Milestone**: `COMMIT_FLOW_STEP_6 - caveats collected, memory updated, barrier next`
 - **Next Pickup Item**: `Reviewer barrier verdict, then present message for seal auth`
 - **Commit Ordering Rule**: All `AGENTS.md` content updates land PRE-seal. `Observed-At` carries timestamp + sealed message only, never commit hashes (hashes mutate on squash and live authoritatively in `jj log`); no post-seal squash cycle exists.
 - **Ground Truth Revalidation Invariant**: Cold-start Planners MUST run fresh VCS status/log inspection; never trust cached Active State.

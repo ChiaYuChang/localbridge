@@ -1,0 +1,73 @@
+# C2 compose startup (one-command gateway with Docker-secrets delivery).
+#
+# TRUST BOUNDARY (locked, honest): same-container downstreams are
+# operator-trusted; secrets/env-sanitation prevent ACCIDENTAL propagation
+# only, never malicious same-container credential access (file-backed
+# compose secrets remain readable in-container; hard isolation would need
+# a stronger process/container boundary).
+#
+# This file itself is TRUSTED input: `file:` refs read host files at
+# config-processing time. Never presented as a sandbox.
+services:
+  gateway:
+    build: .
+    image: local-mcp
+    # Default entrypoint/cmd from the image (tini + entrypoint.sh +
+    # gateway binary). MCP --profile flags pass via `command:` override,
+    # e.g. `command: ["/opt/mcp/bin/gateway", "--config", "/opt/mcp/config/gateway.yaml", "--profile", "go"]`.
+    # NOTE: compose `profiles:` key is NOT used — the name collides with
+    # MCP --profile and would confuse both. Disclaimed explicitly.
+    read_only: true
+    tmpfs:
+      - /tmp
+    volumes:
+      # Replace with a real repo path. Default "." is the build context,
+      # NOT a real workspace (fail-loud: serving repo code as workspace
+      # is almost certainly a mistake — set this deliberately).
+      - ./repo:/workspace:ro
+      - npm-cache:/var/lib/mcp/npm
+      - uv-cache:/var/lib/mcp/uv
+      - pipx-cache:/var/lib/mcp/pipx
+    environment:
+      # Docker-secrets delivery (entrypoint maps _FILE -> var, then
+      # unsets _FILE; direct env preserved when _FILE absent).
+      CONTROL_PLANE_TUNNEL_ID_FILE: /run/secrets/tunnel_id
+      CONTROL_PLANE_API_KEY_FILE: /run/secrets/control_plane_api_key
+      # Runner caches (frozen values so G1-sanitized children keep
+      # runners functional; PIPX_BIN_DIR/HOME choice documented: HOME is
+      # /tmp per image contract, binaries land via explicit env below).
+      npm_config_cache: /var/lib/mcp/npm
+      UV_CACHE_DIR: /var/lib/mcp/uv
+      PIPX_HOME: /var/lib/mcp/pipx
+      PIPX_BIN_DIR: /var/lib/mcp/pipx/bin
+      HOME: /tmp
+    secrets:
+      - tunnel_id
+      - control_plane_api_key
+    # NO restart key (short-lived design; daemon behavior via user
+    # override file, never default). NO ports (tunnel-attached only).
+    #
+    # SECRET BOOTSTRAP (root/sudo REQUIRED for the chown — stated
+    # explicitly, no silent assumption). NEVER commit (gitignored). No
+    # `.example` secret files (example secrets invite accidents — docs
+    # show printf commands instead):
+    #   mkdir -p secrets
+    #   printf %s "$TUNNEL_ID" > secrets/tunnel_id
+    #   printf %s "$API_KEY" > secrets/api_key
+    #   sudo chown 10001:10001 secrets/tunnel_id secrets/api_key
+    #   chmod 0400 secrets/tunnel_id secrets/api_key
+    # Compose file-backed secrets preserve host ownership/mode
+    # (`uid`/`gid`/`mode` keys are IGNORED locally with a warning);
+    # without the chown the fixed `USER mcp` gets Permission denied
+    # (probed failure, not theory).
+
+secrets:
+  tunnel_id:
+    file: ./secrets/tunnel_id
+  control_plane_api_key:
+    file: ./secrets/api_key
+
+volumes:
+  npm-cache:
+  uv-cache:
+  pipx-cache:

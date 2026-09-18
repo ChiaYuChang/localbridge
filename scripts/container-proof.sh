@@ -13,10 +13,15 @@
 # NOTE: docker invocations go through external timeout(1), which cannot
 # execute shell functions — so the shared run flags live in $DFLAGS
 # (intentionally word-split; all paths are space-free mktemp outputs).
+# Compose rows use up -d + wait + logs (never `run --rm`: cleanup spin).
 set -eu
 
 IMAGE="${1:?usage: container-proof.sh <image>}"
 BUILD_TIMEOUT="${BUILD_TIMEOUT:-1800}"
+# Compose rows pin the proof image (default tag local-mcp); --no-build
+# on every compose run row (never build implicitly).
+LOCAL_MCP_IMAGE="${LOCAL_MCP_IMAGE:-$IMAGE}"
+export LOCAL_MCP_IMAGE
 
 fail() { echo "FAIL: $1"; exit 1; }
 
@@ -36,9 +41,21 @@ V_UV="c1proof-uv-$$"
 V_PIPX="c1proof-pipx-$$"
 REAP_C="c1proof-reap-$$"
 CANARY_C="c1proof-canary-$$"
+CPROJ="c2proof$$"
+C2OVERRIDE=""
 cleanup() {
-	rm -rf "$T"
+	code=$?
+	# Diagnostics survive failure (kept dir echoed); success cleans tmp.
+	if [ "$code" -ne 0 ]; then
+		echo "diagnostics kept in $T"
+	else
+		rm -rf "$T"
+	fi
+	rmdir ./repo 2>/dev/null || true
 	docker rm -f "$REAP_C" "$CANARY_C" >/dev/null 2>&1 || true
+	if [ -n "$C2OVERRIDE" ]; then
+		docker compose -p "$CPROJ" -f docker-compose.yml -f "$C2OVERRIDE" rm -sf gateway >/dev/null 2>&1 || true
+	fi
 	docker volume rm -f "$V_NPM" "$V_UV" "$V_PIPX" >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
@@ -255,5 +272,171 @@ timeout 120 docker run $DFLAGS "$IMAGE" sh -c 'test ! -e scripts && test ! -e /r
 if timeout 120 docker run $DFLAGS "$IMAGE" env | grep -i "CONTROL_PLANE" >/dev/null 2>&1; then
 	fail "secret in runtime env"
 fi
+
+# ---- 13. compose rows (C2: Docker-secrets delivery, no real creds) ----
+echo "== compose-config"
+# Fresh compose project per run (fresh network/volume names). Image
+# pinned via LOCAL_MCP_IMAGE + presence-gated, so no row ever builds
+# implicitly.
+CPROJ="c2proof$$"
+# Temp fixtures WITHOUT host sudo: container-root helper chowns the
+# bind-mounted temp dir (documents the no-sudo path). NEVER repo
+# ./secrets (no repo residue; $T cleanup via trap).
+C2S="$T/c2secrets"
+mkdir -p "$C2S"
+printf 'tid-123\n' > "$C2S/tunnel_id"
+printf '  spaced-key  \n' > "$C2S/api_key"
+timeout 120 docker run --rm --user 0 --entrypoint sh -v "$C2S:/w" "$IMAGE" -c 'chown 10001:10001 /w/tunnel_id /w/api_key && chmod 0400 /w/tunnel_id /w/api_key' || fail "secret fixture chown"
+[ "$(stat -c %u:%a "$C2S/tunnel_id")" = "10001:400" ] || fail "fixture perms"
+# Daemon auto-creates missing bind sources (root-owned): pre-create the
+# ./repo bind target ourselves so the run leaves zero residue; trap
+# removes it (ro mount, nothing ever writes there).
+mkdir -p repo
+mkoverride() {
+	# $1 = secrets dir; $2 = extra environment YAML lines (optional).
+	# Command is ALWAYS ["env"]: every compose row asserts env output
+	# or entrypoint errors via up/logs (no `run` anywhere).
+	cat > "$T/override.yml" <<EOF
+services:
+  gateway:
+    image: ${LOCAL_MCP_IMAGE:-local-mcp}
+    command: ["env"]
+${2:-}
+secrets:
+  tunnel_id:
+    file: $1/tunnel_id
+  control_plane_api_key:
+    file: $1/api_key
+EOF
+	C2OVERRIDE="$T/override.yml"
+}
+mkovempty() {
+	# $1 = secrets dir; $2 = extra environment YAML lines. _FILE emptied
+	# (absent path) while secrets stay mounted-but-unused.
+	cat > "$T/override-empty.yml" <<EOF
+services:
+  gateway:
+    image: ${LOCAL_MCP_IMAGE:-local-mcp}
+    command: ["env"]
+    environment:
+      CONTROL_PLANE_TUNNEL_ID_FILE: ""
+      CONTROL_PLANE_API_KEY_FILE: ""
+${2:-}
+secrets:
+  tunnel_id:
+    file: $1/tunnel_id
+  control_plane_api_key:
+    file: $1/api_key
+EOF
+	C2OVERRIDE="$T/override-empty.yml"
+}
+c2up() {
+	# $1 = output file. Pattern: up -d + docker wait + docker logs +
+	# compose rm -sf (no `run --rm` anywhere — its cleanup spins under
+	# load). Container name is deterministic (project-service-1); rm
+	# after every row keeps the index at -1. Returns container exit code.
+	_out=$1
+	# up -d output lands in the file too (mount-time refusals surface
+	# here, before any container exists to log).
+	if ! timeout 120 docker compose -p "$CPROJ" -f docker-compose.yml -f "$C2OVERRIDE" up -d gateway >"$_out" 2>&1; then
+		docker compose -p "$CPROJ" -f docker-compose.yml -f "$C2OVERRIDE" rm -sf gateway >/dev/null 2>&1 || true
+		return 1
+	fi
+	_code=$(timeout 120 docker wait "$CPROJ-gateway-1" 2>/dev/null) || _code=124
+	timeout 120 docker logs "$CPROJ-gateway-1" >"$_out" 2>&1 || true
+	docker compose -p "$CPROJ" -f docker-compose.yml -f "$C2OVERRIDE" rm -sf gateway >/dev/null 2>&1 || true
+	case "$_code" in
+	'' | *[!0-9]*) return 1 ;;
+	*) return "$_code" ;;
+	esac
+}
+mkoverride "$C2S"
+timeout 120 docker compose -p "$CPROJ" -f docker-compose.yml -f "$T/override.yml" config > "$T/cfg.txt" 2>&1 || fail "compose config"
+grep -q "image: $IMAGE" "$T/cfg.txt" || fail "image pin"
+docker image inspect "$IMAGE" >/dev/null || fail "pinned image missing"
+echo "== compose-mapping"
+c2up "$T/cenv.txt" || fail "compose up"
+grep -qxF "CONTROL_PLANE_TUNNEL_ID=tid-123" "$T/cenv.txt" || fail "tunnel_id mapping (CR/LF trim)"
+grep -qxF "CONTROL_PLANE_API_KEY=  spaced-key  " "$T/cenv.txt" || fail "api_key mapping (spaces preserved)"
+if grep -q "_FILE=" "$T/cenv.txt"; then
+	fail "_FILE residue post-mapping"
+fi
+echo "== compose-caches"
+for kv in "npm_config_cache=/var/lib/mcp/npm" "UV_CACHE_DIR=/var/lib/mcp/uv" "PIPX_HOME=/var/lib/mcp/pipx" "PIPX_BIN_DIR=/var/lib/mcp/pipx/bin" "HOME=/tmp"; do
+	grep -qxF "$kv" "$T/cenv.txt" || fail "cache env $kv"
+done
+echo "== compose-file-wins"
+mkoverride "$C2S" "    environment:
+      CONTROL_PLANE_TUNNEL_ID: direct1
+      CONTROL_PLANE_API_KEY: direct2"
+if ! c2up "$T/fw.txt"; then
+	fail "file-wins run"
+fi
+grep -qxF "CONTROL_PLANE_TUNNEL_ID=tid-123" "$T/fw.txt" || fail "file must win for id"
+grep -qxF "CONTROL_PLANE_API_KEY=  spaced-key  " "$T/fw.txt" || fail "file must win for key"
+if grep -q "direct1" "$T/fw.txt" || grep -q "direct2" "$T/fw.txt"; then
+	fail "direct values leaked past file-wins"
+fi
+echo "== compose-direct-env"
+mkovempty "$C2S" "      CONTROL_PLANE_TUNNEL_ID: direct1
+      CONTROL_PLANE_API_KEY: direct2"
+c2up "$T/denv.txt" || fail "direct run"
+grep -qxF "CONTROL_PLANE_TUNNEL_ID=direct1" "$T/denv.txt" || fail "direct passthrough id"
+grep -qxF "CONTROL_PLANE_API_KEY=direct2" "$T/denv.txt" || fail "direct passthrough key"
+echo "== compose-negative"
+mkovempty "$C2S"
+c2up "$T/nenv.txt" || fail "negative run"
+if grep -q "^CONTROL_PLANE_TUNNEL_ID=" "$T/nenv.txt"; then
+	fail "mapping absence leaked"
+fi
+echo "== compose-bad-fixtures"
+mkbad() {
+	# $1 = subdir, $2..$3 = tunnel_id/api_key bytes (printf %b).
+	mkdir -p "$T/c2bad/$1"
+	printf "%b" "$2" > "$T/c2bad/$1/tunnel_id"
+	printf "%b" "$3" > "$T/c2bad/$1/api_key"
+	timeout 120 docker run --rm --user 0 --entrypoint sh -v "$T/c2bad/$1:/w" "$IMAGE" -c 'chown 10001:10001 /w/* && chmod 0400 /w/*' || fail "bad fixture chown $1"
+	mkoverride "$T/c2bad/$1"
+}
+mkbad ws-only '   ' 'valid-key'
+if c2up "$T/ws.txt"; then
+	fail "whitespace-only must refuse"
+fi
+grep -q "CONTROL_PLANE_TUNNEL_ID" "$T/ws.txt" || fail "whitespace error must name var"
+mkbad empty '' 'valid-key'
+if c2up "$T/empty.txt"; then
+	fail "empty must refuse"
+fi
+grep -q "CONTROL_PLANE_TUNNEL_ID" "$T/empty.txt" || fail "empty error must name var"
+mkbad cronly 'tok-cr\r' 'valid-key'
+c2up "$T/cr.txt" || fail "CR-only run"
+grep -qxF "CONTROL_PLANE_TUNNEL_ID=tok-cr" "$T/cr.txt" || fail "CR-only trim"
+mkdir -p "$T/c2bad/perm"
+printf 'valid-key' > "$T/c2bad/perm/api_key"
+printf 'denied-key' > "$T/c2bad/perm/tunnel_id"
+chmod 000 "$T/c2bad/perm/tunnel_id"
+timeout 120 docker run --rm --user 0 --entrypoint sh -v "$T/c2bad/perm:/w" "$IMAGE" -c 'chown 10001:10001 /w/api_key && chmod 0400 /w/api_key' || fail "perm fixture chown"
+mkoverride "$T/c2bad/perm"
+if c2up "$T/perm.txt"; then
+	fail "unreadable must refuse"
+fi
+grep -q "tunnel_id" "$T/perm.txt" || fail "permission error must name path"
+mkdir -p "$T/c2bad/missing"
+printf 'valid-key' > "$T/c2bad/missing/api_key"
+timeout 120 docker run --rm --user 0 --entrypoint sh -v "$T/c2bad/missing:/w" "$IMAGE" -c 'chown 10001:10001 /w/* && chmod 0400 /w/*' || fail "missing fixture chown"
+mkoverride "$T/c2bad/missing"
+if c2up "$T/missing.txt"; then
+	fail "missing file must refuse"
+fi
+grep -q "missing" "$T/missing.txt" || fail "missing error must name path"
+echo "== compose-hygiene"
+[ -z "$(find . -path ./.devenv -prune -o -name '*.example' -print)" ] || fail "*.example files present"
+grep -qxF "secrets/" .gitignore || fail ".gitignore lacks secrets/"
+grep -qxF "secrets/" .dockerignore || fail ".dockerignore lacks secrets/"
+if [ -d ./secrets ]; then
+	[ -z "$(ls -A ./secrets | grep -v '^.gitkeep$')" ] || fail "secrets/ holds more than .gitkeep"
+fi
+echo "== compose-teardown"
+timeout 120 docker compose -p "$CPROJ" -f docker-compose.yml -f "$T/override.yml" down -v >/dev/null || fail "compose down"
 
 echo "container-proof PASS: $IMAGE"
