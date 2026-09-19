@@ -104,6 +104,7 @@ func TestEnvHomes(t *testing.T) {
 		"UV_TOOL_DIR":      root + "/cache/uvtools",
 		"UV_TOOL_BIN_DIR":  root + "/bin",
 		"CARGO_HOME":       root + "/cache/cargo",
+		"RUSTUP_HOME":      "/opt/mcp/rustup",
 		"GOBIN":            root + "/bin",
 		"GOCACHE":          root + "/cache/go/build",
 		"GOMODCACHE":       root + "/cache/go/mod",
@@ -212,6 +213,20 @@ func TestEnvPATHScrubbed(t *testing.T) {
 		}
 	}
 	t.Fatalf("PATH missing from child env")
+}
+
+// Regression cover for the frozen per-manager budgets (cargo bumped
+// to 30m on cold-download+compile evidence).
+func TestDefaultTimeouts(t *testing.T) {
+	got := DefaultTimeouts()
+	for m, want := range map[Manager]time.Duration{
+		Npm: 5 * time.Minute, Uv: 5 * time.Minute,
+		Cargo: 30 * time.Minute, Go: 10 * time.Minute,
+	} {
+		if got[m] != want {
+			t.Errorf("budget %s: got %v want %v", m, got[m], want)
+		}
+	}
 }
 
 // Falsification: relative entries (".", "tools"), empties, and

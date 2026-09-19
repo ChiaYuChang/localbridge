@@ -1,17 +1,22 @@
-# Gateway live config (Phase 2b container sweep): one `live` profile
-# with two stdio downstreams. No secrets, no deny games (plain
-# forwarding proof; deny/mask proven in-process in Phase 1).
+# Desired-state example (Phase 1 installer model): the gateway installs
+# declared downstreams at startup into /var/lib/mcp (receipts in
+# state.json) and starts them from there — no global preinstalls.
 # NOTE: repo-root config enters the Docker build context — never bake
 # secrets into this file (there are none here by construction).
 servers:
   filesystem:
     type: local
     profiles: [live]
-    # Globally installed binary (NOT npx: npx --no-install still hits
-    # the registry for metadata, breaking offline serving; the global
-    # install is the pinned 2026.8.31 by construction).
-    command: [mcp-server-filesystem, /workspace]
-  time:
-    type: local
-    profiles: [live]
-    command: [python3, -m, mcp_server_time]
+    required: false
+    # Installed binary (NOT npx: npx --no-install still hits the
+    # registry for metadata, breaking offline serving; the pinned
+    # 2026.8.31 install is receipts-tracked by construction).
+    command: [/var/lib/mcp/bin/mcp-server-filesystem, /workspace]
+    install:
+      manager: npm
+      package: "@modelcontextprotocol/server-filesystem"
+      version: 2026.8.31
+      binary: mcp-server-filesystem
+  # time (mcp-server-time) OMITTED for now: its installer path
+  # (uv tool install executable name + offline behavior) is unverified.
+  # Re-add with an install stanza only after the contract is proven.

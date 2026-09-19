@@ -303,6 +303,9 @@ echo "== toolchain-presence"
 # Phase-1 row 7 runtime half: all four installer managers present
 # in-image (real installs proven at build time in the contract RUN).
 timeout 120 docker run $DFLAGS "$IMAGE" sh -c 'command -v npm && command -v uv && command -v cargo && command -v go' || fail "installer manager missing in-image"
+# Pinned toolchain: rustc == 1.89.x (rustup, not apt).
+timeout 120 docker run $DFLAGS "$IMAGE" sh -c 'case "$(rustc --version)" in "rustc 1.89."*) ;; *) exit 1;; esac' || fail "rustc version"
+timeout 120 docker run $DFLAGS "$IMAGE" sh -c 'case "$(cargo --version)" in "cargo 1.89."*) ;; *) exit 1;; esac' || fail "cargo version"
 # Round 3 (1): uv is image-resident (/opt/mcp/pipx), never the
 # persistent volume; image PATH orders image dirs before /var/lib/mcp/bin.
 [ "$(timeout 120 docker run $DFLAGS "$IMAGE" sh -c 'command -v uv')" = "/opt/mcp/pipx/bin/uv" ] || fail "uv not image-resident"
@@ -499,7 +502,7 @@ if grep -q "^OPENAI_TUNNEL_ID=" "$T/cenv.txt" || grep -q "^OPENAI_API_KEY=" "$T/
 	fail "entrypoint mapped credentials (single-owner violation)"
 fi
 echo "== compose-caches"
-for kv in "npm_config_cache=/var/lib/mcp/cache/npm" "UV_CACHE_DIR=/var/lib/mcp/cache/uv" "UV_TOOL_DIR=/var/lib/mcp/cache/uvtools" "UV_TOOL_BIN_DIR=/var/lib/mcp/bin" "CARGO_HOME=/var/lib/mcp/cache/cargo" "GOBIN=/var/lib/mcp/bin" "GOCACHE=/var/lib/mcp/cache/go/build" "GOMODCACHE=/var/lib/mcp/cache/go/mod" "GOPATH=/var/lib/mcp/cache/go/path" "PIPX_HOME=/opt/mcp/pipx" "PIPX_BIN_DIR=/opt/mcp/pipx/bin" "HOME=/tmp"; do
+for kv in "npm_config_cache=/var/lib/mcp/cache/npm" "UV_CACHE_DIR=/var/lib/mcp/cache/uv" "UV_TOOL_DIR=/var/lib/mcp/cache/uvtools" "UV_TOOL_BIN_DIR=/var/lib/mcp/bin" "CARGO_HOME=/var/lib/mcp/cache/cargo" "RUSTUP_HOME=/opt/mcp/rustup" "GOBIN=/var/lib/mcp/bin" "GOCACHE=/var/lib/mcp/cache/go/build" "GOMODCACHE=/var/lib/mcp/cache/go/mod" "GOPATH=/var/lib/mcp/cache/go/path" "PIPX_HOME=/opt/mcp/pipx" "PIPX_BIN_DIR=/opt/mcp/pipx/bin" "HOME=/tmp"; do
 	grep -qxF "$kv" "$T/cenv.txt" || fail "cache env $kv"
 done
 echo "== instance-mount"

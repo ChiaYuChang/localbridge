@@ -69,6 +69,7 @@ services:
       UV_TOOL_DIR: /var/lib/mcp/cache/uvtools
       UV_TOOL_BIN_DIR: /var/lib/mcp/bin
       CARGO_HOME: /var/lib/mcp/cache/cargo
+      RUSTUP_HOME: /opt/mcp/rustup
       GOBIN: /var/lib/mcp/bin
       GOCACHE: /var/lib/mcp/cache/go/build
       GOMODCACHE: /var/lib/mcp/cache/go/mod

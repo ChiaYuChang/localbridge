@@ -45,7 +45,7 @@ func DefaultTimeouts() map[Manager]time.Duration {
 	return map[Manager]time.Duration{
 		Npm:   5 * time.Minute,
 		Uv:    5 * time.Minute,
-		Cargo: 15 * time.Minute,
+		Cargo: 30 * time.Minute,
 		Go:    10 * time.Minute,
 	}
 }
@@ -230,6 +230,7 @@ func (in *Installer) env(base []string) []string {
 		"UV_TOOL_DIR":      filepath.Join(c, "uvtools"),
 		"UV_TOOL_BIN_DIR":  in.BinDir(),
 		"CARGO_HOME":       filepath.Join(c, "cargo"),
+		"RUSTUP_HOME":      "/opt/mcp/rustup",
 		"GOBIN":            in.BinDir(),
 		"GOCACHE":          filepath.Join(c, "go", "build"),
 		"GOMODCACHE":       filepath.Join(c, "go", "mod"),

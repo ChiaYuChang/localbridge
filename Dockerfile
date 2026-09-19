@@ -42,11 +42,12 @@ FROM node:lts-trixie-slim
 # One apt layer: git (VCS tooling) + tini (PID 1) + pipx (classic
 # entry-point installs) + curl/ca-certificates (jj tarball fetch only)
 # + python3/pip (Phase 2b live downstreams; node base lacks them)
-# + golang-go/cargo (Phase-1 installer toolchains: go + cargo join the
-# npm/node + uv/python already present — installer-enabled implies
-# executable-present, no runtime toolchain bootstrapping in v1).
+# + golang-go/gcc (Phase-1 installer toolchains: go + rustup cargo join
+# the npm/node + uv/python already present — installer-enabled implies
+# executable-present, no runtime toolchain bootstrapping in v1; gcc +
+# libc6-dev are the crate linker rustup-minimal does not ship).
 RUN apt-get update \
-  && apt-get install -y --no-install-recommends git tini pipx curl ca-certificates python3 python3-pip golang-go cargo \
+  && apt-get install -y --no-install-recommends git tini pipx curl ca-certificates python3 python3-pip golang-go gcc libc6-dev \
   && rm -rf /var/lib/apt/lists/*
 # uv/uvx for modern PEP 723/pyproject flows (joint decision: both uv and
 # pipx are carried — neither is an MCP installer, both are runners).
@@ -54,6 +55,24 @@ RUN apt-get update \
 # /var/lib/mcp tree — all four installer executables must belong to the
 # immutable image so installed shims cannot shadow them.
 RUN mkdir -p /opt/mcp/pipx && PIPX_HOME=/opt/mcp/pipx PIPX_BIN_DIR=/opt/mcp/pipx/bin pipx install uv
+# Rust 1.89.0 via rustup (apt's 1.85.1 is too old for modern crate
+# deps): toolchain image-resident under /opt/mcp/rustup (the persistent
+# volume overlays /var/lib/mcp/cache at runtime, so a volume-homed
+# toolchain would vanish on fresh volumes); registry/git caches stay on
+# the volume via CARGO_HOME. /opt/mcp/bin symlinks keep cargo/rustc
+# resolvable as absolute image paths (installer PATH scrub skips
+# state-root entries by design).
+RUN set -eu; \
+  export RUSTUP_HOME=/opt/mcp/rustup CARGO_HOME=/opt/mcp/cargo-tmp; \
+  mkdir -p /opt/mcp/bin; \
+  curl -fsSL --proto '=https' --tlsv1.2 https://sh.rustup.rs -o /tmp/rustup-init.sh; \
+  sh /tmp/rustup-init.sh -y --default-toolchain 1.89.0 --profile minimal --no-modify-path; \
+  rm -f /tmp/rustup-init.sh; \
+  TC=$(ls /opt/mcp/rustup/toolchains); \
+  ln -s "/opt/mcp/rustup/toolchains/$TC/bin/cargo" /opt/mcp/bin/cargo; \
+  ln -s "/opt/mcp/rustup/toolchains/$TC/bin/rustc" /opt/mcp/bin/rustc; \
+  rm -rf /opt/mcp/cargo-tmp; \
+  /opt/mcp/bin/cargo --version; /opt/mcp/bin/rustc --version
 # No global downstream installs in the runtime image (joint defense):
 # the gateway installs its declared downstreams at startup into the
 # persistent volume (installer); baking servers globally would bypass
@@ -89,6 +108,7 @@ ENV HOME=/tmp \
     UV_TOOL_DIR=/var/lib/mcp/cache/uvtools \
     UV_TOOL_BIN_DIR=/var/lib/mcp/bin \
     CARGO_HOME=/var/lib/mcp/cache/cargo \
+    RUSTUP_HOME=/opt/mcp/rustup \
     GOBIN=/var/lib/mcp/bin \
     GOCACHE=/var/lib/mcp/cache/go/build \
     GOMODCACHE=/var/lib/mcp/cache/go/mod \
