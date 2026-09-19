@@ -343,3 +343,112 @@ func TestLoadYAMLDuplicates(t *testing.T) {
 		}
 	}
 }
+
+func TestInstallValidation(t *testing.T) {
+	good := "servers:\n  a:\n    type: local\n    command: [x]\n    install:\n      manager: npm\n      package: pkg\n      version: 1.0.0\n      binary: bin\n"
+	if _, err := LoadYAML([]byte(good)); err != nil {
+		t.Fatalf("valid install refused: %v", err)
+	}
+	// Unpinned (no version) is valid for npm; go requires a pin.
+	unpinned := "servers:\n  a:\n    type: local\n    command: [x]\n    install:\n      manager: npm\n      package: pkg\n      binary: bin\n"
+	if _, err := LoadYAML([]byte(unpinned)); err != nil {
+		t.Fatalf("unpinned npm install refused: %v", err)
+	}
+	gopinned := "servers:\n  a:\n    type: local\n    command: [x]\n    install:\n      manager: go\n      package: example.com/x\n      version: v1.0.0\n      binary: x\n"
+	if _, err := LoadYAML([]byte(gopinned)); err != nil {
+		t.Fatalf("pinned go install refused: %v", err)
+	}
+	gounpinned := "servers:\n  a:\n    type: local\n    command: [x]\n    install:\n      manager: go\n      package: example.com/x\n      binary: x\n"
+	if _, err := LoadYAML([]byte(gounpinned)); err == nil {
+		t.Fatalf("unpinned go install must refuse")
+	} else if !strings.Contains(err.Error(), `"a"`) || !strings.Contains(err.Error(), "go requires an explicit version") {
+		t.Fatalf("go-pin error must name server+manager: %v", err)
+	}
+	// latest is an explicit version (accepted, kept verbatim for pkg@latest).
+	golatest := "servers:\n  a:\n    type: local\n    command: [x]\n    install:\n      manager: go\n      package: example.com/x\n      version: latest\n      binary: x\n"
+	got, err := LoadYAML([]byte(golatest))
+	if err != nil {
+		t.Fatalf("go@latest refused: %v", err)
+	}
+	if got.Servers["a"].Install.Version != "latest" {
+		t.Fatalf("latest kept verbatim: %+v", got.Servers["a"].Install)
+	}
+	// required defaults false.
+	cfg, err := LoadYAML([]byte("servers:\n  a:\n    type: local\n    command: [x]\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Servers["a"].Required {
+		t.Fatalf("required must default false")
+	}
+}
+
+func TestInstallValidationRejects(t *testing.T) {
+	cases := []struct{ name, data, want string }{
+		{"bad manager", "servers:\n  a:\n    type: local\n    command: [x]\n    install:\n      manager: pip\n      package: p\n      binary: b\n", "npm/uv/cargo/go"},
+		{"empty package", "servers:\n  a:\n    type: local\n    command: [x]\n    install:\n      manager: npm\n      package: ''\n      binary: b\n", ".package"},
+		{"slash binary", "servers:\n  a:\n    type: local\n    command: [x]\n    install:\n      manager: npm\n      package: p\n      binary: sub/b\n", ".binary"},
+		{"dotdot binary", "servers:\n  a:\n    type: local\n    command: [x]\n    install:\n      manager: npm\n      package: p\n      binary: ..\n", ".binary"},
+		{"dash package", "servers:\n  a:\n    type: local\n    command: [x]\n    install:\n      manager: npm\n      package: --version\n      binary: b\n", ".package"},
+		{"dash version", "servers:\n  a:\n    type: local\n    command: [x]\n    install:\n      manager: cargo\n      package: p\n      version: --force\n      binary: b\n", ".version"},
+		{"remote install", "servers:\n  a:\n    type: remote\n    url: http://x\n    install:\n      manager: npm\n      package: p\n      binary: b\n", ".install"},
+	}
+	for _, c := range cases {
+		if _, err := LoadYAML([]byte(c.data)); err == nil {
+			t.Errorf("%s: want refusal", c.name)
+		} else if !strings.Contains(err.Error(), c.want) {
+			t.Errorf("%s: error %q missing %q", c.name, err.Error(), c.want)
+		}
+	}
+}
+
+func TestBinaryIdentity(t *testing.T) {
+	decl := func(mgr, pkg, ver, bin string) string {
+		s := "      manager: " + mgr + "\n      package: " + pkg + "\n"
+		if ver != "" {
+			s += "      version: " + ver + "\n"
+		}
+		return s + "      binary: " + bin + "\n"
+	}
+	srv := func(extra string) string {
+		return "    type: local\n    command: [x]\n    install:\n" + extra
+	}
+	// Identical quadruples may share one binary.
+	share := "servers:\n  a:\n" + srv(decl("npm", "p", "1.0.0", "b")) + "  b:\n" + srv(decl("npm", "p", "1.0.0", "b"))
+	if _, err := LoadYAML([]byte(share)); err != nil {
+		t.Fatalf("identical share refused: %v", err)
+	}
+	// Distinct binaries are fine.
+	distinct := "servers:\n  a:\n" + srv(decl("npm", "p", "1.0.0", "b1")) + "  b:\n" + srv(decl("npm", "p", "2.0.0", "b2"))
+	if _, err := LoadYAML([]byte(distinct)); err != nil {
+		t.Fatalf("distinct refused: %v", err)
+	}
+	// Conflicts (same binary, different identity) fail naming both.
+	for _, c := range []struct{ name, data string }{
+		{"package swap", "servers:\n  a:\n" + srv(decl("npm", "p1", "1.0.0", "b")) + "  b:\n" + srv(decl("npm", "p2", "1.0.0", "b"))},
+		{"version skew", "servers:\n  a:\n" + srv(decl("npm", "p", "1.0.0", "b")) + "  b:\n" + srv(decl("npm", "p", "2.0.0", "b"))},
+		{"manager skew", "servers:\n  a:\n" + srv(decl("npm", "p", "1.0.0", "b")) + "  b:\n" + srv(decl("uv", "p", "1.0.0", "b"))},
+	} {
+		_, err := LoadYAML([]byte(c.data))
+		if err == nil {
+			t.Errorf("%s: conflict must refuse", c.name)
+			continue
+		}
+		if !strings.Contains(err.Error(), `"a"`) || !strings.Contains(err.Error(), `"b"`) || !strings.Contains(err.Error(), "install.binary") {
+			t.Errorf("%s: error must name binary + both servers: %v", c.name, err)
+		}
+	}
+}
+
+func TestValidateInstanceName(t *testing.T) {
+	for _, ok := range []string{"default", "a", "my.inst-1", "A_B.c-d", "x.y_z-0"} {
+		if err := ValidateInstanceName(ok); err != nil {
+			t.Errorf("instance %q must pass: %v", ok, err)
+		}
+	}
+	for _, bad := range []string{"", "../evil", "a/b", "a b", ".", "..", "a$b", "a:b"} {
+		if err := ValidateInstanceName(bad); err == nil {
+			t.Errorf("instance %q must refuse", bad)
+		}
+	}
+}

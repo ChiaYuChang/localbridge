@@ -167,6 +167,22 @@ func encodeSchema(server, name string, schema any) (json.RawMessage, error) {
 	return raw, nil
 }
 
+// ValidateDescriptor runs one discovered tool's contract checks
+// (name charset + object-typed inputSchema) with server+tool keyed
+// errors. Exported for the gateway per-server phase: descriptor faults
+// apply Required per-server there; cross-server namespace collisions
+// stay inside NewProxy (global-abort). Error shape matches the
+// in-constructor path exactly.
+func ValidateDescriptor(server, name string, schema any) error {
+	if _, err := encodeSchema(server, name, schema); err != nil {
+		return err
+	}
+	if err := checkComponent("tool", name); err != nil {
+		return fmt.Errorf("proxy: downstream %q: %w", server, err)
+	}
+	return nil
+}
+
 // NewProxy validates config, discovers all sessions, validates contracts,
 // applies deny (original names, pre-namespace), namespaces, and returns a
 // ready Proxy. Sessions are owned by the caller (G4 wires transports);

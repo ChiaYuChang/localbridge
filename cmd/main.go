@@ -18,6 +18,7 @@ import (
 
 	"github.com/ChiaYuChang/local-mcp/internal/config"
 	"github.com/ChiaYuChang/local-mcp/internal/gateway"
+	"github.com/ChiaYuChang/local-mcp/internal/installer"
 	"github.com/ChiaYuChang/local-mcp/internal/tools/git"
 	"github.com/ChiaYuChang/local-mcp/internal/tools/jj"
 )
@@ -26,12 +27,13 @@ const readyFileEnv = "TUNNEL_CLIENT_SDK_READY_FILE"
 
 func main() {
 	configPath := flag.String("config", "", "gateway config file path ('-' reads stdin; empty serves natives only)")
+	stateDir := flag.String("state-dir", installer.DefaultStateDir, "installer state root (bin/ + state.json + cache/)")
 	var profiles profileFlags
 	flag.Var(&profiles, "profile", "active profile (repeatable)")
 	flag.Parse()
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
-	if err := run(ctx, *configPath, profiles); err != nil {
+	if err := run(ctx, *configPath, *stateDir, profiles); err != nil {
 		log.Fatal(err)
 	}
 }
@@ -45,7 +47,7 @@ func (p *profileFlags) Set(v string) error {
 	return nil
 }
 
-func run(ctx context.Context, configPath string, profiles []string) error {
+func run(ctx context.Context, configPath, stateDir string, profiles []string) error {
 	// Bootstrap: config-source acquisition (file/stdin/empty) with
 	// origin labels; tunnel credential validation lives ONLY here.
 	var (
@@ -93,6 +95,7 @@ func run(ctx context.Context, configPath string, profiles []string) error {
 		Profiles:       profiles,
 		ServeTransport: serverTransport,
 		NativeEnv:      config.BuildEnv(os.Environ(), nil),
+		StateDir:       stateDir,
 	})
 	if err != nil {
 		return err

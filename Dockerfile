@@ -41,22 +41,24 @@ RUN go test ./internal/gateway/ -count=1
 FROM node:lts-trixie-slim
 # One apt layer: git (VCS tooling) + tini (PID 1) + pipx (classic
 # entry-point installs) + curl/ca-certificates (jj tarball fetch only)
-# + python3/pip (Phase 2b live downstreams; node base lacks them).
+# + python3/pip (Phase 2b live downstreams; node base lacks them)
+# + golang-go/cargo (Phase-1 installer toolchains: go + cargo join the
+# npm/node + uv/python already present — installer-enabled implies
+# executable-present, no runtime toolchain bootstrapping in v1).
 RUN apt-get update \
- && apt-get install -y --no-install-recommends git tini pipx curl ca-certificates python3 python3-pip \
- && rm -rf /var/lib/apt/lists/*
+  && apt-get install -y --no-install-recommends git tini pipx curl ca-certificates python3 python3-pip golang-go cargo \
+  && rm -rf /var/lib/apt/lists/*
 # uv/uvx for modern PEP 723/pyproject flows (joint decision: both uv and
 # pipx are carried — neither is an MCP installer, both are runners).
-# Pinned into /var/lib/mcp/pipx (on PATH below) so arbitrary runtime UIDs
-# invoke the same binaries (no per-user installs).
-RUN mkdir -p /var/lib/mcp/pipx && PIPX_HOME=/var/lib/mcp/pipx PIPX_BIN_DIR=/var/lib/mcp/pipx/bin pipx install uv
-# Phase 2b live downstreams (network at build only; versions recorded):
-# filesystem server pinned globally via npm (world-executable bin);
-# time server via pip — NOT pipx: `python3 -m` needs the module
-# importable in system python, which pipx isolation breaks, so the
-# Debian-trixie-correct `pip install --break-system-packages` form.
-RUN npm install -g @modelcontextprotocol/server-filesystem@2026.8.31
-RUN pip install --break-system-packages mcp-server-time==2026.8.18
+# Image-resident by design (round 3): /opt/mcp/pipx, NEVER the persistent
+# /var/lib/mcp tree — all four installer executables must belong to the
+# immutable image so installed shims cannot shadow them.
+RUN mkdir -p /opt/mcp/pipx && PIPX_HOME=/opt/mcp/pipx PIPX_BIN_DIR=/opt/mcp/pipx/bin pipx install uv
+# No global downstream installs in the runtime image (joint defense):
+# the gateway installs its declared downstreams at startup into the
+# persistent volume (installer); baking servers globally would bypass
+# receipts/reconciliation. (Test-stage fixtures stay — build-time
+# suite needs them.)
 # jj 0.41.0 official prebuilt linux-musl tarballs, SHA256 verified.
 # Source: jj-vcs/jj release 318923928 asset digests (musl static, no glibc).
 #   amd64: sha256:42181a80d316ac157874c817c9945e104275114fb461d99e06e2312502f08f99
@@ -75,16 +77,25 @@ RUN set -eu; \
   rm /tmp/jj.tar.gz
 # Layout + explicit non-1000 UID (auto-1000 commonly matches the host and
 # would make ownership tests vacuous). HOME is ALWAYS /tmp (tmpfs);
-# HOME-less operation is forbidden.
+# HOME-less operation is forbidden. /var/lib/mcp split (blueprint):
+# bin/ derived executables, state.json snapshot, cache/ toolchain homes.
+# /opt/mcp holds image executables (localbridge, uv via pipx).
 RUN useradd -u 10001 -U --no-create-home --shell /usr/sbin/nologin mcp \
- && mkdir -p /workspace /var/lib/mcp/npm /var/lib/mcp/uv /var/lib/mcp/pipx /opt/mcp/bin /opt/mcp/config \
- && chown -R mcp:mcp /workspace /var/lib/mcp /opt/mcp
+  && mkdir -p /workspace /var/lib/mcp/bin /var/lib/mcp/cache/npm /var/lib/mcp/cache/uv /var/lib/mcp/cache/uvtools /var/lib/mcp/cache/go /var/lib/mcp/cache/cargo /opt/mcp/bin /opt/mcp/config \
+  && chown -R mcp:mcp /workspace /var/lib/mcp /opt/mcp
 ENV HOME=/tmp \
-    NPM_CONFIG_CACHE=/var/lib/mcp/npm \
-    UV_CACHE_DIR=/var/lib/mcp/uv \
-    PIPX_HOME=/var/lib/mcp/pipx \
-    PIPX_BIN_DIR=/var/lib/mcp/pipx/bin \
-    PATH="/opt/mcp/bin:/var/lib/mcp/pipx/bin:${PATH}"
+    NPM_CONFIG_CACHE=/var/lib/mcp/cache/npm \
+    UV_CACHE_DIR=/var/lib/mcp/cache/uv \
+    UV_TOOL_DIR=/var/lib/mcp/cache/uvtools \
+    UV_TOOL_BIN_DIR=/var/lib/mcp/bin \
+    CARGO_HOME=/var/lib/mcp/cache/cargo \
+    GOBIN=/var/lib/mcp/bin \
+    GOCACHE=/var/lib/mcp/cache/go/build \
+    GOMODCACHE=/var/lib/mcp/cache/go/mod \
+    GOPATH=/var/lib/mcp/cache/go/path \
+    PIPX_HOME=/opt/mcp/pipx \
+    PIPX_BIN_DIR=/opt/mcp/pipx/bin \
+    PATH="/opt/mcp/bin:/opt/mcp/pipx/bin:/var/lib/mcp/bin:${PATH}"
 # Frozen COPY: EXACTLY TWO build-context artifacts (localbridge binary via the
 # build stage + entrypoint script). tini/jj arrive via their own install
 # steps, never via COPY. Runtime-needed files stay world-executable
@@ -92,6 +103,43 @@ ENV HOME=/tmp \
 COPY --from=build --chmod=755 /out/localbridge /opt/mcp/bin/localbridge
 COPY --chmod=755 docker/entrypoint.sh /usr/local/bin/entrypoint.sh
 USER mcp
+# Phase-1 installer contract proof (row 7, in-image): runs AFTER the
+# ENV block so the pipx bin dir (uv) is on PATH. Manager presence (one
+# check each — multi-arg command -v is shell-dependent) + one real
+# install per manager into a throwaway prefix, argv mirroring
+# internal/installer argv() exactly (pinned version FORMS are
+# unit-asserted in Go; fixtures prove the prefix/cache/bin mechanics).
+# cargo --path is fixture-only (production installs registry specs).
+# uv path-installs download a build backend (network at build only).
+RUN set -eu; \
+  command -v npm >/dev/null || { echo "npm missing"; exit 1; }; \
+  command -v uv >/dev/null || { echo "uv missing"; exit 1; }; \
+  command -v cargo >/dev/null || { echo "cargo missing"; exit 1; }; \
+  command -v go >/dev/null || { echo "go missing"; exit 1; }; \
+  P=/tmp/contract; rm -rf "$P"; mkdir -p "$P"; \
+  export NPM_CONFIG_CACHE="$P/cache/npm" UV_CACHE_DIR="$P/cache/uv" UV_TOOL_DIR="$P/uvtools" UV_TOOL_BIN_DIR="$P/pfx/bin" CARGO_HOME="$P/cargohome" GOBIN="$P/pfx/bin" GOCACHE="$P/cache/go/build" GOMODCACHE="$P/cache/go/mod" GOPATH="$P/cache/go/path"; \
+  mkdir -p "$P/npmfix"; \
+  printf '{"name":"fixnpm","version":"0.1.0","bin":{"fixnpm":"cli.js"}}\n' > "$P/npmfix/package.json"; \
+  printf '#!/usr/bin/env node\nconsole.log("fixnpm");\n' > "$P/npmfix/cli.js"; \
+  npm install -g --prefix "$P/pfx" --no-audit --no-fund "$P/npmfix"; \
+  [ -x "$P/pfx/bin/fixnpm" ] || { echo "npm contract: binary missing"; exit 1; }; \
+  mkdir -p "$P/uvfix"; \
+  printf '[project]\nname = "fixuv"\nversion = "0.1.0"\n[project.scripts]\nfixuv = "fixuv:main"\n[build-system]\nrequires = ["setuptools>=61"]\nbuild-backend = "setuptools.build_meta"\n' > "$P/uvfix/pyproject.toml"; \
+  printf 'def main():\n    print("fixuv")\n' > "$P/uvfix/fixuv.py"; \
+  uv tool install --force "$P/uvfix" --color never; \
+  [ -x "$P/pfx/bin/fixuv" ] || { echo "uv contract: binary missing"; exit 1; }; \
+  mkdir -p "$P/cargofix/src"; \
+  printf '[package]\nname = "fixcargo"\nversion = "0.1.0"\nedition = "2021"\n' > "$P/cargofix/Cargo.toml"; \
+  printf 'fn main() { println!("fixcargo"); }\n' > "$P/cargofix/src/main.rs"; \
+  cargo install --root "$P/pfx" --path "$P/cargofix" --color never; \
+  [ -x "$P/pfx/bin/fixcargo" ] || { echo "cargo contract: binary missing"; exit 1; }; \
+  mkdir -p "$P/gofix"; \
+  printf 'module example.com/fixgo\n\ngo 1.21\n' > "$P/gofix/go.mod"; \
+  printf 'package main\n\nimport "fmt"\n\nfunc main() { fmt.Println("fixgo") }\n' > "$P/gofix/main.go"; \
+  (cd "$P/gofix" && GOPROXY=off go install .); \
+  [ -x "$P/pfx/bin/fixgo" ] || { echo "go contract: binary missing"; exit 1; }; \
+  rm -rf "$P"; \
+  echo "installer contract ok: npm/uv/cargo/go"
 # Build-time assertions (parsed comparisons, never print-only):
 # git >= 2.41, jj == 0.41.0-prefix exact, 0755 on localbridge/entrypoint/
 # tini/jj, localbridge executes (serving needs creds — out of envelope

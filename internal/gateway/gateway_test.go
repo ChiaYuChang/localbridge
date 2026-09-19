@@ -27,6 +27,7 @@ type fakeSession struct {
 	name     string
 	tools    []mcp.Tool
 	onCall   func(*mcp.CallToolParams) (*mcp.CallToolResult, error)
+	onTools  func() ([]mcp.Tool, error)
 	mu       sync.Mutex
 	calls    int
 	closes   int
@@ -37,7 +38,12 @@ func ftool(name string) mcp.Tool {
 	return mcp.Tool{Name: name, InputSchema: map[string]any{"type": "object", "properties": map[string]any{}}}
 }
 
-func (s *fakeSession) Tools(context.Context) ([]mcp.Tool, error) { return s.tools, nil }
+func (s *fakeSession) Tools(context.Context) ([]mcp.Tool, error) {
+	if s.onTools != nil {
+		return s.onTools()
+	}
+	return s.tools, nil
+}
 
 func (s *fakeSession) CallTool(_ context.Context, params *mcp.CallToolParams) (*mcp.CallToolResult, error) {
 	s.mu.Lock()
@@ -100,6 +106,10 @@ func serveGateway(t *testing.T, ws string, cfgData []byte, profiles []string, st
 		Profiles:       profiles,
 		ServeTransport: serverTransport,
 		NativeEnv:      []string{"PATH=/usr/bin:/bin", "HOME=" + t.TempDir()},
+		// Hermetic installer root: reconciliation must never touch
+		// the production /var/lib/mcp default (overridden per-test
+		// where installs are exercised).
+		StateDir: t.TempDir(),
 		DialSession: func(ctx context.Context, name string, _ config.ServerConfig) (proxy.Session, error) {
 			s, ok := stubs[name]
 			if !ok {
@@ -223,17 +233,18 @@ func TestRollbackOrderAndCloseCounts(t *testing.T) {
 			WorkspaceRoot: ws, GitRoot: ws, JJRoot: ws,
 			ConfigOrigin: "test:", ServeTransport: mustPair(t),
 			NativeEnv: []string{"PATH=/usr/bin:/bin"},
+			StateDir:  t.TempDir(),
 		}
 	}
-	// Three servers, C dial fails: rollback closes B then A (reverse
-	// creation order), each exactly once.
+	// Three servers, REQUIRED C dial fails: rollback closes B then A
+	// (reverse creation order), each exactly once.
 	var log []string
 	mk := func(name string) *fakeSession {
 		return &fakeSession{name: name, tools: []mcp.Tool{ftool("o")}, closeLog: &log}
 	}
 	a, b := mk("a"), mk("b")
 	opts := base()
-	opts.ConfigData = []byte("servers:\n  a:\n    type: local\n    command: [/bin/true]\n  b:\n    type: local\n    command: [/bin/true]\n  c:\n    type: local\n    command: [/bin/true]\n")
+	opts.ConfigData = []byte("servers:\n  a:\n    type: local\n    command: [/bin/true]\n  b:\n    type: local\n    command: [/bin/true]\n  c:\n    type: local\n    command: [/bin/true]\n    required: true\n")
 	opts.DialSession = func(_ context.Context, name string, _ config.ServerConfig) (proxy.Session, error) {
 		switch name {
 		case "a":
@@ -340,6 +351,7 @@ func TestFailFast(t *testing.T) {
 			WorkspaceRoot: ws, GitRoot: ws, JJRoot: ws,
 			ConfigData: base, ConfigOrigin: "test:",
 			ServeTransport: mustPair(t), NativeEnv: []string{"PATH=/usr/bin:/bin"},
+			StateDir: t.TempDir(),
 			DialSession: func(context.Context, string, config.ServerConfig) (proxy.Session, error) {
 				return echoFake("a"), nil
 			},
@@ -363,12 +375,12 @@ func TestFailFast(t *testing.T) {
 	})
 
 	t.Run("rollback", func(t *testing.T) {
-		// Bad downstream + rollback: B dial fails, A closed exactly
-		// once, original error surfaced.
+		// REQUIRED bad downstream + rollback: B dial fails, A closed
+		// exactly once, original error surfaced (phase-named).
 		var log []string
 		a := &fakeSession{name: "a", tools: []mcp.Tool{ftool("o")}, closeLog: &log}
 		opts := stock()
-		opts.ConfigData = []byte("servers:\n  a:\n    type: local\n    command: [/bin/true]\n  b:\n    type: local\n    command: [/bin/true]\n")
+		opts.ConfigData = []byte("servers:\n  a:\n    type: local\n    command: [/bin/true]\n  b:\n    type: local\n    command: [/bin/true]\n    required: true\n")
 		opts.DialSession = func(_ context.Context, name string, _ config.ServerConfig) (proxy.Session, error) {
 			if name == "b" {
 				return nil, errors.New("boom-B")
@@ -378,6 +390,9 @@ func TestFailFast(t *testing.T) {
 		_, err := Compose(context.Background(), opts)
 		if err == nil || !strings.Contains(err.Error(), "boom-B") {
 			t.Fatalf("want original B error, got %v", err)
+		}
+		if !strings.Contains(err.Error(), `"b" start`) {
+			t.Fatalf("start phase must be named: %v", err)
 		}
 		if len(log) != 1 || log[0] != "a" {
 			t.Fatalf("rollback must close A once: %q", log)

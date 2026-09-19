@@ -36,9 +36,7 @@ command -v jj >/dev/null 2>&1 || fail "host jj required for fixtures"
 T=$(mktemp -d)
 WS="$T/ws"
 mkdir -p "$WS"
-V_NPM="c1proof-npm-$$"
-V_UV="c1proof-uv-$$"
-V_PIPX="c1proof-pipx-$$"
+V_CACHE="c1proof-cache-$$"
 REAP_C="c1proof-reap-$$"
 CANARY_C="c1proof-canary-$$"
 CPROJ="c2proof$$"
@@ -55,14 +53,14 @@ cleanup() {
 	if [ -n "$C2OVERRIDE" ]; then
 		docker compose -p "$CPROJ" -f docker-compose.yml -f "$C2OVERRIDE" rm -sf localbridge >/dev/null 2>&1 || true
 	fi
-	docker volume rm -f "$V_NPM" "$V_UV" "$V_PIPX" >/dev/null 2>&1 || true
+	docker volume rm -f "$V_CACHE" >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
 
 # Shared run flags (runtime contract): read-only root, tmpfs /tmp,
-# ro workspace, named cache volumes. Unquoted on purpose (see NOTE).
+# ro workspace, installer cache volume. Unquoted on purpose (see NOTE).
 # shellcheck disable=SC2086: DFLAGS word-split intentional, space-free paths
-DFLAGS="--rm --read-only --tmpfs /tmp -v $WS:/workspace:ro -v $V_NPM:/var/lib/mcp/npm -v $V_UV:/var/lib/mcp/uv -v $V_PIPX:/var/lib/mcp/pipx"
+DFLAGS="--rm --read-only --tmpfs /tmp -v $WS:/workspace:ro -v $V_CACHE:/var/lib/mcp/cache"
 
 # ---- fixture repos (host UID ownership, != 10001 by gate above) ----
 # NOTE: the git repo lives AT /workspace itself: safe.directory matches
@@ -240,7 +238,7 @@ echo "== baseline-git"
 timeout 120 docker run $DFLAGS "$IMAGE" sh -c 'git -C /workspace status >/dev/null && ! env | grep -q "^GIT_CONFIG"' || fail "baseline git"
 echo "== cache-uid"
 # Cache dirs writable as the fixed UID (explicit, not just implied).
-timeout 120 docker run $DFLAGS "$IMAGE" sh -c '[ "$(id -u)" = "10001" ] && touch /var/lib/mcp/npm/u /var/lib/mcp/uv/u /var/lib/mcp/pipx/u' || fail "cache writable as 10001"
+timeout 120 docker run $DFLAGS "$IMAGE" sh -c '[ "$(id -u)" = "10001" ] && touch /var/lib/mcp/cache/npm/u /var/lib/mcp/cache/uv/u /var/lib/mcp/cache/cargo/u' || fail "cache writable as 10001"
 
 # ---- 9. frozen diff-argv canary (external driver must NOT run) ----
 # Rationale: external diff drivers execute without a TTY, so the canary
@@ -251,9 +249,7 @@ timeout 120 docker run $DFLAGS "$IMAGE" sh -c '[ "$(id -u)" = "10001" ] && touch
 echo "== diff-canary"
 docker run -d --name "$CANARY_C" --read-only --tmpfs /tmp \
 	-v "$WS:/workspace:ro" \
-	-v "$V_NPM:/var/lib/mcp/npm" \
-	-v "$V_UV:/var/lib/mcp/uv" \
-	-v "$V_PIPX:/var/lib/mcp/pipx" \
+	-v "$V_CACHE:/var/lib/mcp/cache" \
 	"$IMAGE" sleep 300 >/dev/null
 # NOTE: `-C` is the repo pin (git analogue of jj `-R`); the frozen
 # portion is the flag sequence `--no-pager diff --no-color --no-ext-diff
@@ -273,8 +269,8 @@ docker rm -f "$CANARY_C" >/dev/null
 
 # ---- 10. /tmp + cache persistence across --rm runs (volumes) ----
 echo "== tmp-caches"
-timeout 120 docker run $DFLAGS "$IMAGE" sh -c 'touch /tmp/ok && touch /var/lib/mcp/npm/m1 /var/lib/mcp/uv/m2 /var/lib/mcp/pipx/m3' || fail "writable dirs"
-timeout 120 docker run $DFLAGS "$IMAGE" sh -c 'test -f /var/lib/mcp/npm/m1 && test -f /var/lib/mcp/uv/m2 && test -f /var/lib/mcp/pipx/m3' || fail "cache persistence"
+timeout 120 docker run $DFLAGS "$IMAGE" sh -c 'touch /tmp/ok && touch /var/lib/mcp/cache/npm/m1 /var/lib/mcp/cache/uv/m2' || fail "writable dirs"
+timeout 120 docker run $DFLAGS "$IMAGE" sh -c 'test -f /var/lib/mcp/cache/npm/m1 && test -f /var/lib/mcp/cache/uv/m2' || fail "cache persistence"
 
 # ---- 11. reaping on standalone stub tree (no gateway involved) ----
 echo "== reaping"
@@ -292,20 +288,35 @@ if timeout 120 docker run $DFLAGS "$IMAGE" env | grep -E "OPENAI_TUNNEL_ID|OPENA
 	fail "secret in runtime env"
 fi
 
-# ---- 12b. Phase 2b live downstreams (versions + runnable) ----
-echo "== downstream-versions"
-timeout 120 docker run --rm "$IMAGE" npm ls -g @modelcontextprotocol/server-filesystem 2>/dev/null | grep -q "2026.8.31" || fail "filesystem version"
-timeout 120 docker run --rm "$IMAGE" pip show mcp-server-time 2>/dev/null | grep -q "^Version: 2026.8.18" || fail "time version"
-echo "== downstream-runnable"
-# Exact working commands pinned here: stdio initialize handshake
-# asserting protocolVersion in the response (stdin held open: an
-# immediate EOF can win the race and mute the server). Filesystem runs
-# via the globally installed binary (NOT npx: --no-install still fetches
-# registry metadata, breaking offline runs).
-(printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"p","version":"0"}}}' '{"jsonrpc":"2.0","method":"notifications/initialized"}'; sleep 2) | timeout 120 docker run --rm -i --read-only --tmpfs /tmp "$IMAGE" mcp-server-filesystem /tmp > "$T/fs-handshake.txt" 2>&1 || fail "filesystem start"
-grep -q '"protocolVersion"' "$T/fs-handshake.txt" || fail "filesystem handshake"
-(printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"p","version":"0"}}}' '{"jsonrpc":"2.0","method":"notifications/initialized"}'; sleep 2) | timeout 120 docker run --rm -i --read-only --tmpfs /tmp "$IMAGE" python3 -m mcp_server_time > "$T/time-handshake.txt" 2>&1 || fail "time start"
-grep -q '"protocolVersion"' "$T/time-handshake.txt" || fail "time handshake"
+# ---- 12b. No stale preinstalls (joint defense): the runtime image
+# carries NO globally installed downstream servers — the installer is
+# the sole install path (receipts/reconciliation). Negative rows:
+# presence checks must FAIL.
+echo "== no-stale-preinstalls"
+if timeout 120 docker run $DFLAGS "$IMAGE" sh -c 'command -v mcp-server-filesystem' >/dev/null 2>&1; then
+	fail "stale global filesystem server present"
+fi
+if timeout 120 docker run $DFLAGS "$IMAGE" python3 -c 'import mcp_server_time' >/dev/null 2>&1; then
+	fail "stale global time server present"
+fi
+echo "== toolchain-presence"
+# Phase-1 row 7 runtime half: all four installer managers present
+# in-image (real installs proven at build time in the contract RUN).
+timeout 120 docker run $DFLAGS "$IMAGE" sh -c 'command -v npm && command -v uv && command -v cargo && command -v go' || fail "installer manager missing in-image"
+# Round 3 (1): uv is image-resident (/opt/mcp/pipx), never the
+# persistent volume; image PATH orders image dirs before /var/lib/mcp/bin.
+[ "$(timeout 120 docker run $DFLAGS "$IMAGE" sh -c 'command -v uv')" = "/opt/mcp/pipx/bin/uv" ] || fail "uv not image-resident"
+timeout 120 docker run $DFLAGS "$IMAGE" sh -c 'case "$PATH" in /opt/mcp/bin:/opt/mcp/pipx/bin:/var/lib/mcp/bin:*) ;; *) exit 1;; esac' || fail "image PATH order"
+echo "== missing-config"
+# Phase-1 row 6: missing gateway.yaml fails clear (names the path),
+# never manufactured — config load precedes tunnel bootstrap, so no
+# creds are needed for this row.
+set +e
+timeout 120 docker run $DFLAGS "$IMAGE" /opt/mcp/bin/localbridge --config /nonexistent/gateway.yaml > "$T/missingcfg.txt" 2>&1
+MISSCFG_CODE=$?
+set -e
+[ "$MISSCFG_CODE" -ne 0 ] || fail "missing config must refuse"
+grep -q "config file /nonexistent/gateway.yaml" "$T/missingcfg.txt" || fail "missing config must name the path"
 echo "== init-sh"
 [ ! -x init.sh ] || fail "init.sh must not carry the exec bit"
 grep -q "sh init.sh" init.sh || fail "init.sh invocation undocumented"
@@ -323,11 +334,51 @@ mkdir -p "$T/fakehome/.config/localbridge/openai_tunnel_id"
 if HOME="$T/fakehome" sh init.sh >/dev/null 2>&1; then
 	fail "dir-shaped secret must refuse"
 fi
+# Instance gate (Phase-1 row 9, DELTA: host-side first): charset check
+# precedes ANY docker invocation. Static presence (case gate text
+# before the docker preflight line) + mount-boundary behavior (fake
+# docker shadow logging every call; illegal names exit non-zero with
+# ZERO docker calls).
+aft_gate=$(grep -n "command -v docker" init.sh | cut -d: -f1)
+gate_line=$(grep -nF '*[!A-Za-z0-9._-]*' init.sh | cut -d: -f1)
+[ -n "$gate_line" ] && [ "$gate_line" -lt "$aft_gate" ] || fail "instance gate must precede docker preflight"
+mkdir -p "$T/fakebin"
+printf '#!/bin/sh\necho "$@" >> "$FAKE_DOCKER_LOG"\nif [ "$1" = "info" ]; then echo "name=rootless"; fi\nexit 0\n' > "$T/fakebin/docker"
+chmod +x "$T/fakebin/docker"
+for evil in '../evil' 'a/b'; do
+	: > "$T/docker.log"
+	if FAKE_DOCKER_LOG="$T/docker.log" PATH="$T/fakebin:$PATH" LOCALBRIDGE_INSTANCE="$evil" sh init.sh >/dev/null 2>&1; then
+		fail "instance '$evil' must refuse"
+	fi
+	[ ! -s "$T/docker.log" ] || fail "instance '$evil' invoked docker (mount boundary violated)"
+done
+# Instance seed: temp HOME + shadowed docker (hermetic regardless of
+# host daemon); secrets absent so init.sh exits 1 AFTER seeding —
+# assert dir 0700 + gateway.yaml 0600 with `servers: {}`.
+mkdir -p "$T/seedhome"
+: > "$T/docker.log"
+if FAKE_DOCKER_LOG="$T/docker.log" PATH="$T/fakebin:$PATH" HOME="$T/seedhome" sh init.sh >/dev/null 2>&1; then
+	fail "seed run must stop at missing secrets"
+fi
+[ "$(stat -c %a "$T/seedhome/.config/localbridge/default")" = "700" ] || fail "instance dir mode"
+[ "$(stat -c %a "$T/seedhome/.config/localbridge/default/gateway.yaml")" = "600" ] || fail "seeded gateway.yaml mode"
+grep -qxF "servers: {}" "$T/seedhome/.config/localbridge/default/gateway.yaml" || fail "seeded content"
+# Never-overwrite: custom content survives a re-run.
+printf 'servers:\n  custom: {}\n' > "$T/seedhome/.config/localbridge/default/gateway.yaml"
+if FAKE_DOCKER_LOG="$T/docker.log" PATH="$T/fakebin:$PATH" HOME="$T/seedhome" sh init.sh >/dev/null 2>&1; then
+	fail "re-run must stop at missing secrets"
+fi
+grep -q "custom" "$T/seedhome/.config/localbridge/default/gateway.yaml" || fail "seed overwrote existing config"
 
 # ---- 13. compose rows (C2: Docker-secrets delivery, no real creds) ----
 # Mapping lives in Go config parsing now (cmd matrix proves it); these
 # rows prove DELIVERY: files mounted readable, _FILE passthrough
 # untouched by the entrypoint, direct env exact, absence clean.
+# Proof HOME confinement: the base file interpolates ${HOME} for the
+# instance mount — point HOME at tmp so docker never auto-creates
+# instance dirs in the operator HOME (trap-cleaned).
+mkdir -p "$T/chome"
+export HOME="$T/chome"
 echo "== compose-config"
 # Fresh compose project per run (fresh network/volume names). Image
 # pinned via LOCAL_MCP_IMAGE + presence-gated, so no row ever builds
@@ -437,7 +488,7 @@ echo "== root-model"
 [ "$(timeout 120 docker run --rm --user 0:0 "$IMAGE" id -u)" = "0" ] || fail "euid 0 in-container"
 timeout 120 docker run --rm --read-only --tmpfs /tmp --user 0:0 -v "$WS:/workspace:ro" "$IMAGE" sh -c 'test -r /workspace/file.txt' || fail "repo readable as root"
 timeout 120 docker run --rm --user 0:0 -v "$C2S:/run/secrets:ro" "$IMAGE" sh -c 'test -r /run/secrets/openai_tunnel_id && test -r /run/secrets/openai_api_key' || fail "secrets readable as root"
-timeout 120 docker run --rm --user 0:0 -v "$V_NPM:/var/lib/mcp/npm" "$IMAGE" sh -c 'touch /var/lib/mcp/npm/rootw' || fail "cache writable as root"
+timeout 120 docker run --rm --user 0:0 -v "$V_CACHE:/var/lib/mcp/cache" "$IMAGE" sh -c 'touch /var/lib/mcp/cache/rootw' || fail "cache writable as root"
 echo "== compose-file-presence"
 # Entrypoint performs NO mapping now (single-owner Go): _FILE lines pass
 # through verbatim; direct secret vars stay absent.
@@ -448,9 +499,32 @@ if grep -q "^OPENAI_TUNNEL_ID=" "$T/cenv.txt" || grep -q "^OPENAI_API_KEY=" "$T/
 	fail "entrypoint mapped credentials (single-owner violation)"
 fi
 echo "== compose-caches"
-for kv in "npm_config_cache=/var/lib/mcp/npm" "UV_CACHE_DIR=/var/lib/mcp/uv" "PIPX_HOME=/var/lib/mcp/pipx" "PIPX_BIN_DIR=/var/lib/mcp/pipx/bin" "HOME=/tmp"; do
+for kv in "npm_config_cache=/var/lib/mcp/cache/npm" "UV_CACHE_DIR=/var/lib/mcp/cache/uv" "UV_TOOL_DIR=/var/lib/mcp/cache/uvtools" "UV_TOOL_BIN_DIR=/var/lib/mcp/bin" "CARGO_HOME=/var/lib/mcp/cache/cargo" "GOBIN=/var/lib/mcp/bin" "GOCACHE=/var/lib/mcp/cache/go/build" "GOMODCACHE=/var/lib/mcp/cache/go/mod" "GOPATH=/var/lib/mcp/cache/go/path" "PIPX_HOME=/opt/mcp/pipx" "PIPX_BIN_DIR=/opt/mcp/pipx/bin" "HOME=/tmp"; do
 	grep -qxF "$kv" "$T/cenv.txt" || fail "cache env $kv"
 done
+echo "== instance-mount"
+# Phase-1 row 5: default compose file mounts the instance dir
+# (fixture HOME keeps the assert host-independent); the legacy
+# repo-file mount must be gone.
+mkdir -p "$T/insthome"
+HOME="$T/insthome" timeout 120 docker compose -p "$CPROJ" -f docker-compose.yml config > "$T/cfg-inst.txt" 2>&1 || fail "instance config render"
+grep -qxF "        source: $T/insthome/.config/localbridge/default" "$T/cfg-inst.txt" || fail "instance mount source missing"
+grep -qxF "        target: /opt/mcp/config" "$T/cfg-inst.txt" || fail "instance mount target missing"
+# rw lives in the source file (rendered long syntax marks ro only).
+grep -q 'localbridge/${LOCALBRIDGE_INSTANCE:-default}:/opt/mcp/config:rw' docker-compose.yml || fail "instance mount not :rw"
+if grep -q "gateway.yaml:/opt/mcp/config" "$T/cfg-inst.txt"; then
+	fail "legacy repo-file mount still present"
+fi
+# Custom instance resolves identically in bind source AND container
+# env (the gateway second-layer gate reads the env var — a missing
+# passthrough would always see default).
+LOCALBRIDGE_INSTANCE="my.inst-1" HOME="$T/insthome" timeout 120 docker compose -p "$CPROJ" -f docker-compose.yml config > "$T/cfg-custom.txt" 2>&1 || fail "custom instance render"
+grep -qxF "        source: $T/insthome/.config/localbridge/my.inst-1" "$T/cfg-custom.txt" || fail "custom bind source"
+grep -qxF "      LOCALBRIDGE_INSTANCE: my.inst-1" "$T/cfg-custom.txt" || fail "custom env render"
+# Runtime container env (up + logs via the env-command override).
+mkoverride "$C2S"
+LOCALBRIDGE_INSTANCE="my.inst-1" c2up "$T/customenv.txt" || fail "custom instance run"
+grep -qxF "LOCALBRIDGE_INSTANCE=my.inst-1" "$T/customenv.txt" || fail "custom container env"
 echo "== workspace-root"
 # Without WORKSPACE_ROOT the gateway serves the process cwd (container
 # /): list_directory(.) would list the container root and git/jj roots

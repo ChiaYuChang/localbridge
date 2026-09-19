@@ -8,6 +8,7 @@ import (
 	"bytes"
 	"fmt"
 	"io"
+	"regexp"
 	"slices"
 	"strings"
 
@@ -23,9 +24,24 @@ type GateConfig struct {
 	Params map[string]string `yaml:"params" json:"params"`
 }
 
+// InstallConfig is one downstream's install declaration (Phase 1):
+// Manager is one of npm/uv/cargo/go; Package is the registry spec;
+// Version pins (absent = unpinned); Binary is the bare executable name
+// expected under <stateDir>/bin after install. Absent Install means a
+// legacy server (no install phase, started as-is).
+type InstallConfig struct {
+	Manager string `yaml:"manager" json:"manager"`
+	Package string `yaml:"package" json:"package"`
+	Version string `yaml:"version,omitempty" json:"version,omitempty"`
+	Binary  string `yaml:"binary"  json:"binary"`
+}
+
 // ServerConfig is one downstream server. Type is "local" (spawned
 // Command) or "remote" (URL). Enabled nil means enabled. Profiles empty
 // means always selected; otherwise selection needs an intersection hit.
+// Required defaults false: install/start failure on a required server
+// aborts startup, on an optional one marks it unavailable (tools
+// absent, gateway serves the rest).
 type ServerConfig struct {
 	Type        string            `yaml:"type"                  json:"type"`
 	Enabled     *bool             `yaml:"enabled,omitempty"     json:"enabled,omitempty"`
@@ -36,6 +52,8 @@ type ServerConfig struct {
 	URL         string            `yaml:"url,omitempty"         json:"url,omitempty"`
 	Headers     map[string]string `yaml:"headers,omitempty"     json:"headers,omitempty"`
 	Deny        []GateConfig      `yaml:"deny,omitempty"        json:"deny,omitempty"`
+	Install     *InstallConfig    `yaml:"install,omitempty"     json:"install,omitempty"`
+	Required    bool              `yaml:"required,omitempty"    json:"required,omitempty"`
 }
 
 // GatewayConfig is the whole file: map key = routing identity =
@@ -66,6 +84,43 @@ func validateGate(path string, g GateConfig) error {
 	return nil
 }
 
+// validateInstall enforces the install declaration shape: manager
+// from the frozen four, package non-empty without whitespace, version
+// (when present) non-empty without whitespace, binary a bare file name
+// (no separators, never . or ..) since it addresses <stateDir>/bin.
+func validateInstall(path string, in *InstallConfig) error {
+	switch in.Manager {
+	case "npm", "uv", "cargo", "go":
+	default:
+		return fmt.Errorf("%s.manager: must be one of npm/uv/cargo/go, got %q", path, in.Manager)
+	}
+	if in.Package == "" || strings.ContainsAny(in.Package, " \t\r\n") {
+		return fmt.Errorf("%s.package: must be non-empty without whitespace", path)
+	}
+	// Leading-dash package/version would parse as manager flags in
+	// argv position (exec is shell-free, but managers do their own
+	// flag parsing) — fail closed.
+	if strings.HasPrefix(in.Package, "-") {
+		return fmt.Errorf("%s.package: must not start with '-'", path)
+	}
+	if strings.ContainsAny(in.Version, " \t\r\n") {
+		return fmt.Errorf("%s.version: must not contain whitespace", path)
+	}
+	if strings.HasPrefix(in.Version, "-") {
+		return fmt.Errorf("%s.version: must not start with '-'", path)
+	}
+	// Go installs resolve through the module proxy at a pinned version
+	// (@latest is network-resolved and unreproducible); npm/uv/cargo
+	// keep unpinned allowed (registry default).
+	if in.Manager == "go" && in.Version == "" {
+		return fmt.Errorf("%s: go requires an explicit version (e.g. v1.2.3 or latest)", path)
+	}
+	if in.Binary == "" || in.Binary == "." || in.Binary == ".." || strings.ContainsRune(in.Binary, '/') {
+		return fmt.Errorf("%s.binary: must be a bare file name", path)
+	}
+	return nil
+}
+
 // validateServer enforces one server's shape with field-path errors.
 func validateServer(name string, s ServerConfig) error {
 	p := fmt.Sprintf("servers[%q]", name)
@@ -89,6 +144,9 @@ func validateServer(name string, s ServerConfig) error {
 		if len(s.Command) > 0 {
 			return fmt.Errorf("%s.command: forbidden for remote server", p)
 		}
+		if s.Install != nil {
+			return fmt.Errorf("%s.install: forbidden for remote server (install is local-only)", p)
+		}
 		if s.WorkDir != "" {
 			return fmt.Errorf("%s.workdir: forbidden for remote server", p)
 		}
@@ -98,6 +156,11 @@ func validateServer(name string, s ServerConfig) error {
 	}
 	for i, g := range s.Deny {
 		if err := validateGate(fmt.Sprintf("%s.deny[%d]", p, i), g); err != nil {
+			return err
+		}
+	}
+	if s.Install != nil {
+		if err := validateInstall(fmt.Sprintf("%s.install", p), s.Install); err != nil {
 			return err
 		}
 	}
@@ -142,6 +205,28 @@ func Validate(cfg GatewayConfig) error {
 			return err
 		}
 	}
+	// Binary identity: two servers installing different packages to
+	// the same binary name would overwrite silently. Identical
+	// (manager,package,version,binary) quadruples may share (one
+	// install satisfies both); any conflict fails pre-reconciliation.
+	type identity struct{ manager, pkg, ver, bin string }
+	seen := make(map[string]identity)
+	owners := make(map[string]string)
+	for _, name := range names {
+		in := cfg.Servers[name].Install
+		if in == nil {
+			continue
+		}
+		id := identity{in.Manager, in.Package, in.Version, in.Binary}
+		if prev, ok := seen[in.Binary]; ok {
+			if prev != id {
+				return fmt.Errorf("servers[%q].install.binary %q: conflicts with servers[%q] (different install identity sharing one binary)", name, in.Binary, owners[in.Binary])
+			}
+			continue
+		}
+		seen[in.Binary] = id
+		owners[in.Binary] = name
+	}
 	return nil
 }
 
@@ -171,6 +256,30 @@ func SelectActive(cfg GatewayConfig, active []string) []string {
 	}
 	slices.Sort(out)
 	return out
+}
+
+// instanceNameRe is the frozen instance charset: NEVER derived from a
+// repo basename (repos move/rename/share basenames); explicit
+// LOCALBRIDGE_INSTANCE only, default "default".
+var instanceNameRe = regexp.MustCompile(`^[A-Za-z0-9._-]+$`)
+
+// ValidateInstanceName fail-closes on empty or charset-violating
+// instance names. Callers apply the "default" default before calling;
+// empty here is always an error (unset vs empty are indistinguishable
+// downstream, so both mean default upstream).
+func ValidateInstanceName(name string) error {
+	if name == "" {
+		return fmt.Errorf("instance name must not be empty")
+	}
+	// Dots are charset-legal but "." / ".." are never valid identities
+	// (path traversal out of the instance dir) — reject explicitly.
+	if name == "." || name == ".." {
+		return fmt.Errorf("instance name %q: must not be %q", name, name)
+	}
+	if !instanceNameRe.MatchString(name) {
+		return fmt.Errorf("instance name %q: must match [A-Za-z0-9._-]+", name)
+	}
+	return nil
 }
 
 // envBaseline is the FROZEN child-env allowlist: copied from the process

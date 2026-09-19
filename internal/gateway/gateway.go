@@ -18,6 +18,7 @@ import (
 	"sync"
 
 	"github.com/ChiaYuChang/local-mcp/internal/config"
+	"github.com/ChiaYuChang/local-mcp/internal/installer"
 	"github.com/ChiaYuChang/local-mcp/internal/proxy"
 	"github.com/ChiaYuChang/local-mcp/internal/tools"
 	"github.com/ChiaYuChang/local-mcp/internal/tools/filesystem"
@@ -74,11 +75,32 @@ func DialConfigured(po proxy.Options, onChanged func(context.Context, *mcp.ToolL
 	}
 }
 
+// InstanceEnv is the explicit instance name source (default
+// "default" when unset; NEVER derived from repo basenames). Compose
+// re-validates the charset as the second layer (host-side init.sh is
+// first); illegal names fail closed before any startup work.
+const InstanceEnv = "LOCALBRIDGE_INSTANCE"
+
+// cachedSession freezes one server's discovery list: Compose
+// discovers per-server (Required applied) BEFORE proxy construction,
+// so NewProxy never re-hits the network for tools/list. CallTool and
+// Close delegate untouched.
+type cachedSession struct {
+	proxy.Session
+	tools []mcp.Tool
+}
+
+func (c *cachedSession) Tools(context.Context) ([]mcp.Tool, error) {
+	return c.tools, nil
+}
+
 // Options carries everything Compose needs. ServeTransport is
 // caller-created (transport ownership: serving uses it only, never
 // closes it — single-owner against SDK semantics; no double-close
 // across core/bootstrap/harness). DialSession nil selects
 // DialConfigured (production path). PageSize 0 takes the SDK default.
+// StateDir "" selects the installer default; InstallRunner nil selects
+// direct exec (tests inject fakes — no network).
 type Options struct {
 	WorkspaceRoot  string
 	GitRoot        string
@@ -92,6 +114,8 @@ type Options struct {
 	ProxyOptions   proxy.Options
 	NativeEnv      []string
 	OnListChanged  func(context.Context, *mcp.ToolListChangedRequest)
+	StateDir       string
+	InstallRunner  installer.Runner
 }
 
 // Gateway is the composed serving core: upstream server, proxy, sessions
@@ -105,8 +129,21 @@ type Gateway struct {
 	git       *git.Git
 	jj        *jj.JJ
 	transport mcp.Transport
-	mu        sync.Mutex
-	served    bool
+	// unavailable names optional servers that failed install/start
+	// (recorded, tools absent, gateway serves the rest).
+	unavailable map[string]string
+	mu          sync.Mutex
+	served      bool
+}
+
+// Unavailable returns the recorded optional-server failures
+// (server -> install/start error text).
+func (g *Gateway) Unavailable() map[string]string {
+	out := make(map[string]string, len(g.unavailable))
+	for k, v := range g.unavailable {
+		out[k] = v
+	}
+	return out
 }
 
 // nativeTools is the FROZEN native set through the single registry path:
@@ -128,6 +165,15 @@ func Compose(ctx context.Context, opts Options) (*Gateway, error) {
 	if opts.ServeTransport == nil {
 		return nil, fmt.Errorf("gateway: serve transport required")
 	}
+	// Instance second-layer gate (host-side init.sh is first):
+	// fail closed before any startup work.
+	instance := os.Getenv(InstanceEnv)
+	if instance == "" {
+		instance = "default"
+	}
+	if err := config.ValidateInstanceName(instance); err != nil {
+		return nil, fmt.Errorf("gateway: invalid %s: %w", InstanceEnv, err)
+	}
 	dial := opts.DialSession
 	if dial == nil {
 		dial = DialConfigured(opts.ProxyOptions, opts.OnListChanged)
@@ -144,6 +190,20 @@ func Compose(ctx context.Context, opts Options) (*Gateway, error) {
 		}
 	}
 	active := config.SelectActive(cfg, opts.Profiles)
+
+	// Startup reconciliation (Phase 1): install declared downstreams
+	// into the state dir, then start them. Required install failure
+	// aborts here (nothing acquired yet — no rollback needed; records
+	// already persisted). Optional failures return unavailable.
+	stateDir := opts.StateDir
+	if stateDir == "" {
+		stateDir = installer.DefaultStateDir
+	}
+	inst := installer.New(stateDir, opts.InstallRunner, nil)
+	unavailable, err := installer.Reconcile(ctx, inst, cfg, active)
+	if err != nil {
+		return nil, err
+	}
 
 	// Natives: roots + Hider singletons.
 	fs, err := filesystem.New(opts.WorkspaceRoot)
@@ -201,14 +261,66 @@ func Compose(ctx context.Context, opts Options) (*Gateway, error) {
 	}
 	var downs []namedDown
 	for _, name := range active {
+		if _, skip := unavailable[name]; skip {
+			continue // optional install failure: tools absent
+		}
 		scfg := cfg.Servers[name]
 		sess, err := dial(ctx, name, scfg)
 		if err != nil {
-			_, rerr := rollback(fmt.Errorf("gateway: downstream %q: %w", name, err))
+			if !scfg.Required {
+				unavailable[name] = fmt.Sprintf("server %q start: %v", name, err)
+				continue // optional start failure: serve the rest
+			}
+			_, rerr := rollback(fmt.Errorf("gateway: downstream %q start: %w", name, err))
 			return nil, rerr
 		}
-		sessions = append(sessions, sess)
-		downs = append(downs, namedDown{name: name, cfg: scfg, sess: sess})
+		// Per-server discovery (Required applied): a tools/list
+		// failure on an optional server closes its session and
+		// serves the rest; required aborts via the ledger.
+		// Registry collisions inside NewProxy stay global-abort
+		// (deterministic configuration error, not transient I/O).
+		tools, err := sess.Tools(ctx)
+		if err != nil {
+			if !scfg.Required {
+				_ = sess.Close()
+				unavailable[name] = fmt.Sprintf("server %q discovery: %v", name, err)
+				continue
+			}
+			sessions = append(sessions, sess)
+			_, rerr := rollback(fmt.Errorf("gateway: downstream %q discovery: %w", name, err))
+			return nil, rerr
+		}
+		cached := &cachedSession{Session: sess, tools: tools}
+		// Per-server descriptor validation (malformed contracts in
+		// one optional server must not abort the rest): denied tools
+		// are skipped (deny stays a working escape hatch for broken
+		// tools). Required faults abort via the ledger.
+		denied := make(map[string]bool, len(scfg.Deny))
+		for _, gd := range scfg.Deny {
+			denied[gd.Params["value"]] = true
+		}
+		badDescriptor := false
+		for _, t := range tools {
+			if denied[t.Name] {
+				continue
+			}
+			if derr := proxy.ValidateDescriptor(name, t.Name, t.InputSchema); derr != nil {
+				if !scfg.Required {
+					_ = sess.Close()
+					unavailable[name] = fmt.Sprintf("server %q descriptor: %v", name, derr)
+					badDescriptor = true
+					break
+				}
+				sessions = append(sessions, sess)
+				_, rerr := rollback(fmt.Errorf("gateway: downstream %q descriptor: %w", name, derr))
+				return nil, rerr
+			}
+		}
+		if badDescriptor {
+			continue
+		}
+		sessions = append(sessions, cached)
+		downs = append(downs, namedDown{name: name, cfg: scfg, sess: cached})
 	}
 
 	// G3 proxy (deny converted mechanically; shape re-validated there).
@@ -264,6 +376,7 @@ func Compose(ctx context.Context, opts Options) (*Gateway, error) {
 	return &Gateway{
 		upstream: upstream, proxy: px, sessions: sessions,
 		fs: fs, git: g, jj: j, transport: opts.ServeTransport,
+		unavailable: unavailable,
 	}, nil
 }
 

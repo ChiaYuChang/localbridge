@@ -8,9 +8,21 @@
 set -eu
 
 fail() { echo "FAIL: $1" >&2; exit 1; }
-warn() { echo "WARN: $1" >&2; }
 
-# ---- preflight: docker present, rootless daemon, versions ----
+# ---- 0. instance gate (HOST-SIDE FIRST: before ANY docker invocation;
+# direct compose-with-custom-instance is UNSUPPORTED — this gate is the
+# mount boundary; the gateway re-validates as second layer only) ----
+LOCALBRIDGE_INSTANCE="${LOCALBRIDGE_INSTANCE:-default}"
+case "$LOCALBRIDGE_INSTANCE" in
+	"") fail "LOCALBRIDGE_INSTANCE must not be empty" ;;
+	.|..) fail "LOCALBRIDGE_INSTANCE must not be '$LOCALBRIDGE_INSTANCE'" ;;
+	*[!A-Za-z0-9._-]*) fail "LOCALBRIDGE_INSTANCE '$LOCALBRIDGE_INSTANCE' must match [A-Za-z0-9._-]+" ;;
+esac
+echo "instance: $LOCALBRIDGE_INSTANCE"
+
+# ---- preflight: docker present, rootless daemon ----
+# (Host needs nothing else: downstream installs run in-container via
+# the gateway installer; the old npx/python3 host prefetch is gone.)
 command -v docker >/dev/null 2>&1 || fail "docker CLI missing"
 docker info >/dev/null 2>&1 || fail "docker daemon unreachable"
 if docker info -f '{{.SecurityOptions}}' 2>/dev/null | grep -q "name=rootless"; then
@@ -18,9 +30,24 @@ if docker info -f '{{.SecurityOptions}}' 2>/dev/null | grep -q "name=rootless"; 
 else
 	fail "daemon is not rootless (primary model requires rootless; container UID 0 must map to the operator, not host root)"
 fi
-command -v npx >/dev/null 2>&1 || fail "npx missing (host-side prefetch needs it)"
-command -v python3 >/dev/null 2>&1 || fail "python3 missing (host-side prefetch needs it)"
-echo "host: $(npx --version 2>/dev/null || echo 'npx-unavailable') / $(python3 --version 2>&1)"
+
+# ---- instance seed (create-time only: dir 0700 + minimal gateway.yaml
+# 0600 iff absent; NEVER overwrites; NEVER manufactures at runtime —
+# the entrypoint/gateway fail clear on a missing gateway.yaml) ----
+# Runs BEFORE the secrets check: provisioning must not be blocked by
+# missing credentials.
+INSTDIR="$HOME/.config/localbridge/$LOCALBRIDGE_INSTANCE"
+mkdir -p "$INSTDIR"
+chmod 0700 "$INSTDIR"
+[ "$(stat -c %a "$INSTDIR")" = "700" ] || fail "mode of $INSTDIR must be 0700"
+if [ ! -e "$INSTDIR/gateway.yaml" ]; then
+	printf 'servers: {}\n' > "$INSTDIR/gateway.yaml"
+	chmod 0600 "$INSTDIR/gateway.yaml"
+	echo "seeded: $INSTDIR/gateway.yaml (servers: {}, 0600)"
+else
+	[ -f "$INSTDIR/gateway.yaml" ] || fail "not a regular file: $INSTDIR/gateway.yaml"
+	echo "instance config kept: $INSTDIR/gateway.yaml (never overwritten)"
+fi
 
 # ---- secrets bootstrap (HOME only, invoking user owns everything) ----
 # Secret home: ~/.config/localbridge/ (single location shared by
@@ -47,20 +74,6 @@ EOF
 	[ "$(stat -c %a "$SECDIR/$f")" = "400" ] || fail "mode of $SECDIR/$f must be 0400"
 done
 echo "secrets dir OK: $SECDIR (dir 0700, owner + 0400 verified, never chowned)"
-
-# ---- prefetch for host-side runs (Phase 2a cache; warn-only offline) ----
-# NOTE: --help is consumed as a directory arg (server starts, rejects
-# the bogus dir): "accessible" in output proves cache hit + execution.
-if npx -y @modelcontextprotocol/server-filesystem@2026.8.31 --help 2>&1 | grep -q "accessible"; then
-	echo "prefetch: server-filesystem cached"
-else
-	warn "npx prefetch failed (offline?) — Phase 2a driver will report SERVER_MISSING"
-fi
-if python3 -c "import mcp_server_time" 2>/dev/null; then
-	echo "prefetch: mcp-server-time importable"
-else
-	warn "mcp_server_time not importable — install per your python policy, then re-run"
-fi
 
 # ---- next steps ----
 cat <<'EOF'
