@@ -452,3 +452,66 @@ func TestValidateInstanceName(t *testing.T) {
 		}
 	}
 }
+
+func TestIsEnabled(t *testing.T) {
+	// Truth table: nil -> true (omitted means enabled).
+	cases := []struct {
+		name string
+		in   *bool
+		want bool
+	}{
+		{"nil", nil, true},
+		{"true", boolPtr(true), true},
+		{"false", boolPtr(false), false},
+	}
+	for _, c := range cases {
+		if got := (ServerConfig{Enabled: c.in}).IsEnabled(); got != c.want {
+			t.Errorf("%s: got %v want %v", c.name, got, c.want)
+		}
+	}
+}
+
+func TestCloneAlias(t *testing.T) {
+	// Mutating the clone must never alias the original (fails on
+	// shallow copy sharing maps, slices, or pointer leaves).
+	orig := GatewayConfig{Servers: map[string]ServerConfig{
+		"web": {
+			Type:        "local",
+			Enabled:     boolPtr(true),
+			Profiles:    []string{"live"},
+			Command:     []string{"/bin/true"},
+			Environment: map[string]string{"FOO": "bar"},
+			Deny:        []GateConfig{{Type: "exact", Params: map[string]string{"value": "x"}}},
+			Install:     &InstallConfig{Manager: "npm", Package: "p", Binary: "b"},
+		},
+		"api": {Type: "remote", URL: "http://x.test", Headers: map[string]string{"H": "v"}},
+	}}
+	clone := orig.Clone()
+	mut := clone.Servers["web"]
+	mut.Profiles[0] = "MUT"
+	mut.Command[0] = "MUT"
+	mut.Environment["FOO"] = "MUT"
+	mut.Deny[0].Params["value"] = "MUT"
+	*mut.Enabled = false
+	mut.Install.Binary = "MUT"
+	clone.Servers["web"] = mut
+	clone.Servers["api"] = ServerConfig{Type: "remote", URL: "MUT"}
+	clone.Servers["new"] = ServerConfig{Type: "local", Command: []string{"x"}}
+
+	got := orig.Servers["web"]
+	if got.Profiles[0] != "live" || got.Command[0] != "/bin/true" || got.Environment["FOO"] != "bar" {
+		t.Fatalf("slice/map leaf aliased: %+v", got)
+	}
+	if got.Deny[0].Params["value"] != "x" {
+		t.Fatalf("deny params aliased: %+v", got.Deny)
+	}
+	if !*got.Enabled || got.Install.Binary != "b" {
+		t.Fatalf("pointer leaf aliased: %+v", got)
+	}
+	if _, ok := orig.Servers["new"]; ok {
+		t.Fatalf("inserted server leaked into original")
+	}
+	if orig.Servers["api"].URL != "http://x.test" || orig.Servers["api"].Headers["H"] != "v" {
+		t.Fatalf("replaced server aliased original: %+v", orig.Servers["api"])
+	}
+}

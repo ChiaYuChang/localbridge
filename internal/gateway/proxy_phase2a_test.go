@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/ChiaYuChang/local-mcp/internal/config"
 	"github.com/ChiaYuChang/local-mcp/internal/proxy"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
@@ -75,8 +76,7 @@ func servePhase2a(t *testing.T, name, profile string, command []string) (*Gatewa
 		WorkspaceRoot:  ws,
 		GitRoot:        ws,
 		JJRoot:         ws,
-		ConfigData:     []byte(yaml),
-		ConfigOrigin:   "test-phase2a:",
+		Source:         config.Source{Data: []byte(yaml), Origin: "test-phase2a:"},
 		Profiles:       []string{profile},
 		ServeTransport: serverTransport,
 		NativeEnv:      []string{"PATH=/usr/bin:/bin", "HOME=" + t.TempDir()},

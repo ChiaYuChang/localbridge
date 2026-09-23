@@ -8,6 +8,8 @@ import (
 	"bytes"
 	"fmt"
 	"io"
+	"os"
+	"path/filepath"
 	"regexp"
 	"slices"
 	"strings"
@@ -60,6 +62,62 @@ type ServerConfig struct {
 // namespace key.
 type GatewayConfig struct {
 	Servers map[string]ServerConfig `yaml:"servers" json:"servers"`
+}
+
+// IsEnabled reports the effective switch: nil means enabled.
+func (s ServerConfig) IsEnabled() bool {
+	return s.Enabled == nil || *s.Enabled
+}
+
+// Clone deep-copies the config (maps, slices, and pointer leaves);
+// mutating the clone never aliases the original.
+func (c GatewayConfig) Clone() GatewayConfig {
+	if c.Servers == nil {
+		return GatewayConfig{Servers: map[string]ServerConfig{}}
+	}
+	out := GatewayConfig{Servers: make(map[string]ServerConfig, len(c.Servers))}
+	for name, s := range c.Servers {
+		cp := s
+		if s.Profiles != nil {
+			cp.Profiles = append([]string(nil), s.Profiles...)
+		}
+		if s.Command != nil {
+			cp.Command = append([]string(nil), s.Command...)
+		}
+		if s.Environment != nil {
+			cp.Environment = make(map[string]string, len(s.Environment))
+			for k, v := range s.Environment {
+				cp.Environment[k] = v
+			}
+		}
+		if s.Headers != nil {
+			cp.Headers = make(map[string]string, len(s.Headers))
+			for k, v := range s.Headers {
+				cp.Headers[k] = v
+			}
+		}
+		if s.Deny != nil {
+			cp.Deny = append([]GateConfig(nil), s.Deny...)
+			for i := range cp.Deny {
+				if s.Deny[i].Params != nil {
+					cp.Deny[i].Params = make(map[string]string, len(s.Deny[i].Params))
+					for k, v := range s.Deny[i].Params {
+						cp.Deny[i].Params[k] = v
+					}
+				}
+			}
+		}
+		if s.Enabled != nil {
+			v := *s.Enabled
+			cp.Enabled = &v
+		}
+		if s.Install != nil {
+			ic := *s.Install
+			cp.Install = &ic
+		}
+		out.Servers[name] = cp
+	}
+	return out
 }
 
 // validateGate enforces the exact-only rule with field-path errors.
@@ -237,7 +295,7 @@ func Validate(cfg GatewayConfig) error {
 func SelectActive(cfg GatewayConfig, active []string) []string {
 	out := []string{}
 	for name, s := range cfg.Servers {
-		if s.Enabled != nil && !*s.Enabled {
+		if !s.IsEnabled() {
 			continue
 		}
 		if len(s.Profiles) > 0 {
@@ -386,4 +444,115 @@ func LoadYAML(data []byte) (GatewayConfig, error) {
 		return GatewayConfig{}, err
 	}
 	return cfg, nil
+}
+
+// Source is the single config-source value: Origin labels errors
+// (e.g. "config file <path>:"), Data holds composed bytes (the
+// snapshot), Path is the instance file ("" = stdin/empty bootstrap:
+// mutation disabled, Data reads).
+type Source struct {
+	Origin string
+	Data   []byte
+	Path   string
+}
+
+// Reload implements the read precedence: Path readable -> file bytes;
+// else Data when present; else hard error (Path set, nothing to read)
+// or empty config (Path empty, Data empty: natives-only bootstrap).
+func (s Source) Reload() (GatewayConfig, error) {
+	if s.Path != "" {
+		if data, err := os.ReadFile(s.Path); err == nil {
+			cfg, err := LoadYAML(data)
+			if err != nil {
+				return GatewayConfig{}, err
+			}
+			if cfg.Servers == nil {
+				cfg.Servers = map[string]ServerConfig{}
+			}
+			return cfg, nil
+		}
+		if len(s.Data) > 0 {
+			cfg, err := LoadYAML(s.Data)
+			if err != nil {
+				return GatewayConfig{}, err
+			}
+			if cfg.Servers == nil {
+				cfg.Servers = map[string]ServerConfig{}
+			}
+			return cfg, nil
+		}
+		return GatewayConfig{}, fmt.Errorf("config file %q unreadable and no snapshot data", s.Path)
+	}
+	if len(s.Data) > 0 {
+		cfg, err := LoadYAML(s.Data)
+		if err != nil {
+			return GatewayConfig{}, err
+		}
+		if cfg.Servers == nil {
+			cfg.Servers = map[string]ServerConfig{}
+		}
+		return cfg, nil
+	}
+	return GatewayConfig{Servers: map[string]ServerConfig{}}, nil
+}
+
+// Update validates, atomically rewrites Path (mode 0600, fsync before
+// rename), and refreshes Data. Empty Path fails closed (read-only
+// source). Secret policy lives with callers (admin), not here.
+func (s *Source) Update(cfg GatewayConfig) error {
+	if s.Path == "" {
+		return fmt.Errorf("config: update unavailable (read-only source, no file path)")
+	}
+	if err := Validate(cfg); err != nil {
+		return err
+	}
+	out, err := yaml.Marshal(cfg)
+	if err != nil {
+		return fmt.Errorf("config: marshal: %w", err)
+	}
+	if err := atomicWriteFile(s.Path, out); err != nil {
+		return err
+	}
+	s.Data = out
+	return nil
+}
+
+// atomicWriteFile writes data via tmp+rename in the same dir, mode
+// 0600, fsync before rename. No partial file observable.
+func atomicWriteFile(path string, data []byte) error {
+	dir := filepath.Dir(path)
+	tmp, err := os.CreateTemp(dir, ".gateway-*.tmp")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	// Best-effort cleanup on failure; success renames away.
+	defer func() { _ = os.Remove(tmpName) }()
+	if err := tmp.Chmod(0o600); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if _, err := tmp.Write(data); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := os.Chmod(tmpName, 0o600); err != nil {
+		return err
+	}
+	if err := os.Rename(tmpName, path); err != nil {
+		return err
+	}
+	// Best-effort dir fsync for durability (failure non-fatal).
+	if d, err := os.Open(dir); err == nil {
+		_ = d.Sync()
+		_ = d.Close()
+	}
+	return nil
 }

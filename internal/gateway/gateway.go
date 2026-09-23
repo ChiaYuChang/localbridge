@@ -21,12 +21,14 @@ import (
 	"github.com/ChiaYuChang/local-mcp/internal/installer"
 	"github.com/ChiaYuChang/local-mcp/internal/proxy"
 	"github.com/ChiaYuChang/local-mcp/internal/tools"
+	"github.com/ChiaYuChang/local-mcp/internal/tools/admin"
 	"github.com/ChiaYuChang/local-mcp/internal/tools/filesystem"
 	"github.com/ChiaYuChang/local-mcp/internal/tools/git"
 	"github.com/ChiaYuChang/local-mcp/internal/tools/jj"
 	"github.com/ChiaYuChang/local-mcp/internal/tools/secrets"
 	"github.com/ChiaYuChang/local-mcp/internal/tools/test"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
+	"go.yaml.in/yaml/v3"
 )
 
 // LoadSource acquires config bytes with an origin label: path "-" reads
@@ -100,13 +102,14 @@ func (c *cachedSession) Tools(context.Context) ([]mcp.Tool, error) {
 // across core/bootstrap/harness). DialSession nil selects
 // DialConfigured (production path). PageSize 0 takes the SDK default.
 // StateDir "" selects the installer default; InstallRunner nil selects
-// direct exec (tests inject fakes — no network).
+// direct exec (tests inject fakes — no network). Source is the single
+// config-source value: empty Path means stdin/empty bootstrap (admin
+// mutating tools hard-error, reads serve composed Data).
 type Options struct {
 	WorkspaceRoot  string
 	GitRoot        string
 	JJRoot         string
-	ConfigData     []byte
-	ConfigOrigin   string
+	Source         config.Source
 	Profiles       []string
 	ServeTransport mcp.Transport
 	PageSize       int
@@ -149,12 +152,14 @@ func (g *Gateway) Unavailable() map[string]string {
 // nativeTools is the FROZEN native set through the single registry path:
 // 8 filesystem + 4 git + 4 jj + echo (RETAINED ToolEcho implementation,
 // registered like any native — no second registration path, echo joins
-// the uniqueness check).
-func nativeTools(fs *filesystem.FileSystem, g *git.Git, j *jj.JJ, h *secrets.SecretHider) []tools.Tool {
+// the uniqueness check) + 5 admin (restart-loaded gateway.yaml mutation,
+// redacted reads, atomic 0600 writes; no delete path).
+func nativeTools(fs *filesystem.FileSystem, g *git.Git, j *jj.JJ, h *secrets.SecretHider, a admin.Admin) []tools.Tool {
 	out := filesystem.NativeTools(fs, h)
 	out = append(out, git.NativeTools(g, h)...)
 	out = append(out, jj.NativeTools(j, h)...)
-	return append(out, test.ToolEcho{})
+	out = append(out, test.ToolEcho{})
+	return append(out, admin.NativeTools(a)...)
 }
 
 // Compose runs every stage through registration and returns a ready
@@ -178,16 +183,19 @@ func Compose(ctx context.Context, opts Options) (*Gateway, error) {
 	if dial == nil {
 		dial = DialConfigured(opts.ProxyOptions, opts.OnListChanged)
 	}
-	// G1 parse/validate/select (LoadYAML validates internally).
-	// Absent config bytes mean an empty gateway (natives only) — the
-	// bootstrap default; never a parse error.
-	var cfg config.GatewayConfig
-	if len(opts.ConfigData) > 0 {
-		var err error
-		cfg, err = config.LoadYAML(opts.ConfigData)
-		if err != nil {
-			return nil, fmt.Errorf("gateway: %s %w", opts.ConfigOrigin, err)
-		}
+	// G1 parse/validate/select (LoadYAML validates internally via
+	// Source.Reload). Absent config bytes mean an empty gateway
+	// (natives only) — the bootstrap default; never a parse error.
+	cfg, err := opts.Source.Reload()
+	if err != nil {
+		return nil, fmt.Errorf("gateway: %s %w", opts.Source.Origin, err)
+	}
+	// Admin snapshot: canonical bytes of the composed config (file
+	// reads win at use time; the clone keeps Compose's map free of
+	// admin aliasing).
+	snapData, err := yaml.Marshal(cfg.Clone())
+	if err != nil {
+		return nil, fmt.Errorf("gateway: snapshot: %w", err)
 	}
 	active := config.SelectActive(cfg, opts.Profiles)
 
@@ -247,7 +255,7 @@ func Compose(ctx context.Context, opts Options) (*Gateway, error) {
 		sopts = &mcp.ServerOptions{PageSize: opts.PageSize}
 	}
 	upstream := mcp.NewServer(&mcp.Implementation{Name: "local-mcp-gateway", Version: "0.0.1"}, sopts)
-	natives := nativeTools(fs, g, j, h)
+	natives := nativeTools(fs, g, j, h, admin.Admin{Source: config.Source{Origin: opts.Source.Origin, Data: snapData, Path: opts.Source.Path}})
 	nativeNames := make([]string, 0, len(natives))
 	for _, t := range natives {
 		nativeNames = append(nativeNames, t.Name())

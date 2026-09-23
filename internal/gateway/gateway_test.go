@@ -101,8 +101,7 @@ func serveGateway(t *testing.T, ws string, cfgData []byte, profiles []string, st
 		WorkspaceRoot:  ws,
 		GitRoot:        ws,
 		JJRoot:         ws,
-		ConfigData:     cfgData,
-		ConfigOrigin:   "test:",
+		Source:         config.Source{Data: cfgData, Origin: "test:"},
 		Profiles:       profiles,
 		ServeTransport: serverTransport,
 		NativeEnv:      []string{"PATH=/usr/bin:/bin", "HOME=" + t.TempDir()},
@@ -181,6 +180,8 @@ var frozenNatives = []string{
 	"git_status", "git_diff", "git_log", "git_show",
 	"jj_status", "jj_diff", "jj_log", "jj_show",
 	"echo",
+	"admin_list_servers", "admin_get_server", "admin_get_server_details",
+	"admin_set_server_enabled", "admin_upsert_server",
 }
 
 func TestComposeBijection(t *testing.T) {
@@ -231,7 +232,7 @@ func TestRollbackOrderAndCloseCounts(t *testing.T) {
 	base := func() Options {
 		return Options{
 			WorkspaceRoot: ws, GitRoot: ws, JJRoot: ws,
-			ConfigOrigin: "test:", ServeTransport: mustPair(t),
+			Source: config.Source{Origin: "test:"}, ServeTransport: mustPair(t),
 			NativeEnv: []string{"PATH=/usr/bin:/bin"},
 			StateDir:  t.TempDir(),
 		}
@@ -244,7 +245,7 @@ func TestRollbackOrderAndCloseCounts(t *testing.T) {
 	}
 	a, b := mk("a"), mk("b")
 	opts := base()
-	opts.ConfigData = []byte("servers:\n  a:\n    type: local\n    command: [/bin/true]\n  b:\n    type: local\n    command: [/bin/true]\n  c:\n    type: local\n    command: [/bin/true]\n    required: true\n")
+	opts.Source.Data = []byte("servers:\n  a:\n    type: local\n    command: [/bin/true]\n  b:\n    type: local\n    command: [/bin/true]\n  c:\n    type: local\n    command: [/bin/true]\n    required: true\n")
 	opts.DialSession = func(_ context.Context, name string, _ config.ServerConfig) (proxy.Session, error) {
 		switch name {
 		case "a":
@@ -268,7 +269,7 @@ func TestRollbackOrderAndCloseCounts(t *testing.T) {
 	}
 	x, y := mk2("x"), mk2("y")
 	opts2 := base()
-	opts2.ConfigData = []byte("servers:\n  x:\n    type: local\n    command: [/bin/true]\n  y:\n    type: local\n    command: [/bin/true]\n")
+	opts2.Source.Data = []byte("servers:\n  x:\n    type: local\n    command: [/bin/true]\n  y:\n    type: local\n    command: [/bin/true]\n")
 	opts2.DialSession = func(_ context.Context, name string, _ config.ServerConfig) (proxy.Session, error) {
 		if name == "x" {
 			return x, nil
@@ -349,7 +350,7 @@ func TestFailFast(t *testing.T) {
 	stock := func() Options {
 		return Options{
 			WorkspaceRoot: ws, GitRoot: ws, JJRoot: ws,
-			ConfigData: base, ConfigOrigin: "test:",
+			Source:         config.Source{Data: base, Origin: "test:"},
 			ServeTransport: mustPair(t), NativeEnv: []string{"PATH=/usr/bin:/bin"},
 			StateDir: t.TempDir(),
 			DialSession: func(context.Context, string, config.ServerConfig) (proxy.Session, error) {
@@ -360,7 +361,7 @@ func TestFailFast(t *testing.T) {
 
 	t.Run("config", func(t *testing.T) {
 		opts := stock()
-		opts.ConfigData = []byte("servers:\n  a:\n    type: bogus\n")
+		opts.Source.Data = []byte("servers:\n  a:\n    type: bogus\n")
 		if _, err := Compose(context.Background(), opts); err == nil {
 			t.Fatalf("bad config must refuse")
 		}
@@ -380,7 +381,7 @@ func TestFailFast(t *testing.T) {
 		var log []string
 		a := &fakeSession{name: "a", tools: []mcp.Tool{ftool("o")}, closeLog: &log}
 		opts := stock()
-		opts.ConfigData = []byte("servers:\n  a:\n    type: local\n    command: [/bin/true]\n  b:\n    type: local\n    command: [/bin/true]\n    required: true\n")
+		opts.Source.Data = []byte("servers:\n  a:\n    type: local\n    command: [/bin/true]\n  b:\n    type: local\n    command: [/bin/true]\n    required: true\n")
 		opts.DialSession = func(_ context.Context, name string, _ config.ServerConfig) (proxy.Session, error) {
 			if name == "b" {
 				return nil, errors.New("boom-B")
@@ -546,7 +547,7 @@ func TestComposeEmptyConfig(t *testing.T) {
 	serverTransport, clientTransport := mcp.NewInMemoryTransports()
 	gw, err := Compose(context.Background(), Options{
 		WorkspaceRoot: ws, GitRoot: ws, JJRoot: ws,
-		ConfigData: nil, ConfigOrigin: "default(empty)",
+		Source:         config.Source{Data: nil, Origin: "default(empty)"},
 		ServeTransport: serverTransport, NativeEnv: []string{"PATH=/usr/bin:/bin"},
 	})
 	if err != nil {
@@ -659,7 +660,7 @@ func TestTransportOwnership(t *testing.T) {
 	counted := &connectCountingTransport{inner: serverTransport}
 	opts := Options{
 		WorkspaceRoot: ws, GitRoot: ws, JJRoot: ws,
-		ConfigData: []byte("servers: {}"), ConfigOrigin: "test:",
+		Source:         config.Source{Data: []byte("servers: {}"), Origin: "test:"},
 		ServeTransport: counted, NativeEnv: []string{"PATH=/usr/bin:/bin"},
 		DialSession: func(context.Context, string, config.ServerConfig) (proxy.Session, error) {
 			t.Fatalf("no downstreams expected")
@@ -807,5 +808,82 @@ func TestRealSmoke(t *testing.T) {
 	res = clientCall(t, cs, "jj_status", nil)
 	if clientText(t, res) == "" {
 		t.Fatalf("native jj through gateway: empty")
+	}
+}
+
+func TestAdminRegistry22(t *testing.T) {
+	// 22 natives registered (17 + 5 admin) via single registry.
+	ws := fixtureWorkspace(t)
+	_, cs, _ := serveGateway(t, ws, []byte("servers: {}"), nil, map[string]*fakeSession{}, nil)
+	got := clientTools(t, cs)
+	if len(got) != 22 {
+		t.Fatalf("registry = %d, want 22 in %q", len(got), got)
+	}
+	for _, n := range []string{
+		"admin_list_servers", "admin_get_server", "admin_get_server_details",
+		"admin_set_server_enabled", "admin_upsert_server",
+	} {
+		if !slices.Contains(got, n) {
+			t.Fatalf("missing admin native %q in %q", n, got)
+		}
+	}
+}
+
+func TestAdminRestartBoundaryFreshCompose(t *testing.T) {
+	// True fresh-Compose proof, no container: mutate via admin tool,
+	// read mutated file bytes, run a NEW Compose with those bytes as
+	// Source.Data + stub DialSession; assert composed tool set reflects
+	// the edit (disabled server absent, added server present).
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "gateway.yaml")
+	initial := "servers:\n  d1:\n    type: local\n    command: [/bin/true]\n  d2:\n    type: local\n    command: [/bin/true]\n"
+	if err := os.WriteFile(cfgPath, []byte(initial), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// Drive mutations through the MCP boundary: disable d1, add d3 via
+	// a live gateway client, then re-compose fresh.
+	ws := fixtureWorkspace(t)
+	stubs := map[string]*fakeSession{
+		"d1": {name: "d1", tools: []mcp.Tool{ftool("alpha")}},
+		"d2": {name: "d2", tools: []mcp.Tool{ftool("beta")}},
+	}
+	_, cs, _ := serveGateway(t, ws, []byte(initial), nil, stubs, func(o *Options) {
+		o.Source.Path = cfgPath
+	})
+	if _, err := cs.CallTool(context.Background(), &mcp.CallToolParams{
+		Name:      "admin_set_server_enabled",
+		Arguments: map[string]any{"name": "d1", "enabled": false},
+	}); err != nil {
+		t.Fatalf("disable d1: %v", err)
+	}
+	if _, err := cs.CallTool(context.Background(), &mcp.CallToolParams{
+		Name: "admin_upsert_server",
+		Arguments: map[string]any{
+			"name":   "d3",
+			"server": map[string]any{"type": "local", "command": []string{"/bin/true"}},
+		},
+	}); err != nil {
+		t.Fatalf("upsert d3: %v", err)
+	}
+	mutated, err := os.ReadFile(cfgPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Fresh Compose from mutated bytes (real startup path honors edits).
+	freshStubs := map[string]*fakeSession{
+		"d1": {name: "d1", tools: []mcp.Tool{ftool("alpha")}},
+		"d2": {name: "d2", tools: []mcp.Tool{ftool("beta")}},
+		"d3": {name: "d3", tools: []mcp.Tool{ftool("gamma")}},
+	}
+	_, cs2, _ := serveGateway(t, ws, mutated, nil, freshStubs, nil)
+	got := clientTools(t, cs2)
+	if slices.Contains(got, "d1__alpha") {
+		t.Fatalf("disabled d1 tool must be absent in %q", got)
+	}
+	if !slices.Contains(got, "d2__beta") {
+		t.Fatalf("d2 tool missing in %q", got)
+	}
+	if !slices.Contains(got, "d3__gamma") {
+		t.Fatalf("added d3 tool missing in %q", got)
 	}
 }

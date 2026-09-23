@@ -10,6 +10,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/ChiaYuChang/local-mcp/internal/config"
 	"github.com/ChiaYuChang/local-mcp/internal/proxy"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
@@ -60,8 +61,7 @@ func serveLive(t *testing.T, stubBin string, denyValue string) (*Gateway, *mcp.C
 		WorkspaceRoot:  ws,
 		GitRoot:        ws,
 		JJRoot:         ws,
-		ConfigData:     []byte(yaml),
-		ConfigOrigin:   "test-e2e:",
+		Source:         config.Source{Data: []byte(yaml), Origin: "test-e2e:"},
 		Profiles:       []string{"e2e"},
 		ServeTransport: serverTransport,
 		NativeEnv:      []string{"PATH=/usr/bin:/bin", "HOME=" + t.TempDir()},
@@ -121,15 +121,15 @@ func TestProxyE2EPlain(t *testing.T) {
 	if !slices.Contains(got, "stub__echo_back") {
 		t.Fatalf("row 1: stub__echo_back missing in %q", got)
 	}
-	// Row 5 (plain run): natives 17 intact.
+	// Row 5 (plain run): natives 22 intact.
 	nativeCount := 0
 	for _, n := range got {
 		if !strings.Contains(n, "__") {
 			nativeCount++
 		}
 	}
-	if nativeCount != 17 {
-		t.Fatalf("row 5: natives = %d, want 17 in %q", nativeCount, got)
+	if nativeCount != 22 {
+		t.Fatalf("row 5: natives = %d, want 22 in %q", nativeCount, got)
 	}
 
 	// Row 2: verbatim round-trip through the gateway.
@@ -164,15 +164,15 @@ func TestProxyE2EDeny(t *testing.T) {
 	if errors.As(err, &derr) {
 		t.Fatalf("row 3: must not be DownstreamError: %v", err)
 	}
-	// Row 5 (deny run): natives 17 intact.
+	// Row 5 (deny run): natives 22 intact.
 	nativeCount := 0
 	for _, n := range got {
 		if !strings.Contains(n, "__") {
 			nativeCount++
 		}
 	}
-	if nativeCount != 17 {
-		t.Fatalf("row 5: natives = %d, want 17 in %q", nativeCount, got)
+	if nativeCount != 22 {
+		t.Fatalf("row 5: natives = %d, want 22 in %q", nativeCount, got)
 	}
 }
 
@@ -197,7 +197,7 @@ func TestProxyE2EMask(t *testing.T) {
 	if strings.Contains(text, "sk-abcdefghijklmnop1234") {
 		t.Fatalf("row 4: raw secret leaked: %q", text)
 	}
-	// Row 5 (mask run): natives 17 intact.
+	// Row 5 (mask run): natives 22 intact.
 	got := liveTools(t, cs)
 	nativeCount := 0
 	for _, n := range got {
@@ -205,7 +205,7 @@ func TestProxyE2EMask(t *testing.T) {
 			nativeCount++
 		}
 	}
-	if nativeCount != 17 {
-		t.Fatalf("row 5: natives = %d, want 17 in %q", nativeCount, got)
+	if nativeCount != 22 {
+		t.Fatalf("row 5: natives = %d, want 22 in %q", nativeCount, got)
 	}
 }

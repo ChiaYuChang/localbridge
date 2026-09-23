@@ -48,27 +48,25 @@ func (p *profileFlags) Set(v string) error {
 }
 
 func run(ctx context.Context, configPath, stateDir string, profiles []string) error {
-	// Bootstrap: config-source acquisition (file/stdin/empty) with
-	// origin labels; tunnel credential validation lives ONLY here.
-	var (
-		configData   []byte
-		configOrigin string
-	)
+	// Bootstrap: config-source acquisition (file/stdin/empty) into one
+	// config.Source value; tunnel credential validation lives ONLY here.
+	var src config.Source
 	switch configPath {
 	case "":
-		configOrigin = "default(empty)"
+		src = config.Source{Origin: "default(empty)"}
 	case "-":
-		var err error
-		configData, configOrigin, err = gateway.LoadSource("-", os.Stdin)
+		data, origin, err := gateway.LoadSource("-", os.Stdin)
 		if err != nil {
 			return err
 		}
+		src = config.Source{Origin: origin, Data: data}
 	default:
-		var err error
-		configData, configOrigin, err = gateway.LoadSource(configPath, nil)
+		data, origin, err := gateway.LoadSource(configPath, nil)
 		if err != nil {
 			return err
 		}
+		// Path set (mutation enabled) + Data (composed snapshot).
+		src = config.Source{Origin: origin, Data: data, Path: configPath}
 	}
 
 	workspaceRoot := os.Getenv("WORKSPACE_ROOT")
@@ -90,8 +88,7 @@ func run(ctx context.Context, configPath, stateDir string, profiles []string) er
 		WorkspaceRoot:  workspaceRoot,
 		GitRoot:        gitRoot,
 		JJRoot:         jjRoot,
-		ConfigData:     configData,
-		ConfigOrigin:   configOrigin,
+		Source:         src,
 		Profiles:       profiles,
 		ServeTransport: serverTransport,
 		NativeEnv:      config.BuildEnv(os.Environ(), nil),

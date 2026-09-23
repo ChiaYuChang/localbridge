@@ -7,12 +7,15 @@ downstream tools to ChatGPT through an OpenAI tunnel.
 
 A single MCP endpoint combining three capabilities:
 
-- **17 read-only natives** — 8 filesystem (`read_file`,
+- **22 natives** — 17 read-only (8 filesystem (`read_file`,
   `read_multiple_files`, `search_files`, `search_within_files`,
   `list_directory`, `tree`, `get_file_info`,
   `list_allowed_directories`), 4 git (`git_status`, `git_diff`,
   `git_log`, `git_show`), 4 jj (`jj_status`, `jj_diff`, `jj_log`,
-  `jj_show`), plus `echo`.
+  `jj_show`), plus `echo`) + 5 admin (`admin_list_servers`,
+  `admin_get_server`, `admin_get_server_details`,
+  `admin_set_server_enabled`, `admin_upsert_server`;
+  restart-loaded config mutation, see §5).
 - **Downstream proxy by profile** — external MCP servers (local stdio
   or remote HTTP) selected per profile, namespaced `server__tool`
 (e.g. `filesystem__read_file`), with deny rules and secret masking
@@ -26,7 +29,7 @@ resources; binary/structured unchanged).
 
 | Layer | Code | Role |
 |---|---|---|
-| Natives | `internal/tools/*` | 17 tools, shared Hider, no network |
+| Natives | `internal/tools/*` | 22 tools (17 read-only + 5 admin), shared Hider, no network |
 | Config | `internal/config` | YAML parse/validate, profile selection, sanitized child env |
 | Sessions + forwarding | `internal/proxy` | downstream sessions (timeouts, typed errors), `__` namespace, deny filter, output masking |
 | Composition | `internal/gateway` | staged startup, native registry, rollback, serving |
@@ -70,8 +73,8 @@ using the tunnel ID stored in
 `~/.config/localbridge/openai_tunnel_id` (the connector handles
 authentication; localbridge never receives your ChatGPT credentials).
 
-Call tools by name: the 17 natives directly (`read_file`, `git_log`,
-`jj_status`, `echo`, ...), downstream tools as `server__tool`, where
+Call tools by name: the 22 natives directly (`read_file`, `git_log`,
+`jj_status`, `echo`, `admin_list_servers`, ...), downstream tools as `server__tool`, where
 `server` matches a `servers:` key in `gateway.yaml`.
 
 Switch profiles by editing the compose service `command:` line
@@ -116,6 +119,36 @@ Tunnel credentials resolve in Go only (single owner), no aliases:
 whitespace-only rejected), then unset so children never inherit paths.
 Compose delivers them via file-backed secrets at
 `/run/secrets/tunnel_id` and `/run/secrets/api_key`.
+
+### Admin tools (restart-loaded)
+
+Five natives inspect or mutate `gateway.yaml` without hand-editing:
+`admin_list_servers`, `admin_get_server`, `admin_get_server_details`,
+`admin_set_server_enabled`, `admin_upsert_server` (no delete path —
+server removal is operator volume reset only).
+
+- Restart-required: all changes take effect on container restart only
+  (install + enable/disable uniformly restart-loaded). No runtime
+  session/proxy mutation. After editing via admin tools, restart or
+  recreate the container (`docker compose restart localbridge` or
+  `docker compose up -d --force-recreate`); the next startup composes
+  the new set. Rebuilding the image without recreating/restarting the
+  container does not apply edits.
+- Atomic + validated: write path loads the current file, mutates the
+  struct, runs `config.Validate` on the whole config, then atomic
+  tmp+rename in the same dir, mode `0600`, fsync before rename.
+  Validation failure leaves original bytes intact.
+- Redaction: `admin_list_servers` never emits `environment`/`headers`;
+  `admin_get_server` returns exactly `name`, `enabled`, `profiles`;
+  `admin_get_server_details` returns keys + value lengths only (values
+  never emitted). Instance config must not hold secrets.
+- Secret guard (fail closed): `environment`/`headers` keys matching
+  case-insensitive `OPENAI_`, `KEY`, `SECRET`, `TOKEN`, `AUTH`,
+  `BEARER`, `COOKIE`, `CREDENTIAL`, `PASSWORD` as substrings are
+  refused with zero bytes written.
+- Read-only bootstrap: with `--config -` (stdin) or empty
+  (natives-only), mutating admin tools hard-error naming
+  unavailability; list/get serve the startup snapshot.
 
 ## 6. Trust model (summary)
 

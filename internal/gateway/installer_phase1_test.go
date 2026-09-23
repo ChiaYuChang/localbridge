@@ -114,8 +114,7 @@ func TestComposeRequiredInstallFailure(t *testing.T) {
 	var calls int
 	opts := Options{
 		WorkspaceRoot: ws, GitRoot: ws, JJRoot: ws,
-		ConfigData:     []byte("servers:\n  srv:\n    type: local\n    command: [/bin/true]\n    required: true\n    install:\n      manager: npm\n      package: pkg-srv\n      binary: srvbin\n"),
-		ConfigOrigin:   "test:",
+		Source:         config.Source{Data: []byte("servers:\n  srv:\n    type: local\n    command: [/bin/true]\n    required: true\n    install:\n      manager: npm\n      package: pkg-srv\n      binary: srvbin\n"), Origin: "test:"},
 		ServeTransport: serverTransport,
 		NativeEnv:      []string{"PATH=/usr/bin:/bin"},
 		StateDir:       t.TempDir(),
@@ -139,8 +138,7 @@ func TestComposeOptionalStartFailure(t *testing.T) {
 	good := echoFake("good")
 	opts := Options{
 		WorkspaceRoot: ws, GitRoot: ws, JJRoot: ws,
-		ConfigData:     []byte("servers:\n  bad:\n    type: local\n    command: [/bin/true]\n  good:\n    type: local\n    command: [/bin/true]\n"),
-		ConfigOrigin:   "test:",
+		Source:         config.Source{Data: []byte("servers:\n  bad:\n    type: local\n    command: [/bin/true]\n  good:\n    type: local\n    command: [/bin/true]\n"), Origin: "test:"},
 		ServeTransport: serverTransport,
 		NativeEnv:      []string{"PATH=/usr/bin:/bin"},
 		StateDir:       t.TempDir(),
@@ -188,7 +186,7 @@ func TestComposeInstanceGate(t *testing.T) {
 		serverTransport, _ := mcp.NewInMemoryTransports()
 		return Options{
 			WorkspaceRoot: ws, GitRoot: ws, JJRoot: ws,
-			ConfigData: []byte("servers: {}\n"), ConfigOrigin: "test:",
+			Source:         config.Source{Data: []byte("servers: {}\n"), Origin: "test:"},
 			ServeTransport: serverTransport,
 			NativeEnv:      []string{"PATH=/usr/bin:/bin"},
 			StateDir:       t.TempDir(),
@@ -250,8 +248,7 @@ func TestComposeRequiredDiscoveryFailure(t *testing.T) {
 	}}
 	opts := Options{
 		WorkspaceRoot: ws, GitRoot: ws, JJRoot: ws,
-		ConfigData:     []byte("servers:\n  a:\n    type: local\n    command: [/bin/true]\n  bad:\n    type: local\n    command: [/bin/true]\n    required: true\n"),
-		ConfigOrigin:   "test:",
+		Source:         config.Source{Data: []byte("servers:\n  a:\n    type: local\n    command: [/bin/true]\n  bad:\n    type: local\n    command: [/bin/true]\n    required: true\n"), Origin: "test:"},
 		ServeTransport: serverTransport,
 		NativeEnv:      []string{"PATH=/usr/bin:/bin"},
 		StateDir:       t.TempDir(),
@@ -305,8 +302,7 @@ func TestComposeRequiredDescriptorFailure(t *testing.T) {
 	badTool := mcp.Tool{Name: "oops", InputSchema: map[string]any{"type": "string"}}
 	opts := Options{
 		WorkspaceRoot: ws, GitRoot: ws, JJRoot: ws,
-		ConfigData:     []byte("servers:\n  bad:\n    type: local\n    command: [/bin/true]\n    required: true\n"),
-		ConfigOrigin:   "test:",
+		Source:         config.Source{Data: []byte("servers:\n  bad:\n    type: local\n    command: [/bin/true]\n    required: true\n"), Origin: "test:"},
 		ServeTransport: serverTransport,
 		NativeEnv:      []string{"PATH=/usr/bin:/bin"},
 		StateDir:       t.TempDir(),
@@ -357,8 +353,7 @@ func TestComposeCollisionStaysGlobal(t *testing.T) {
 	}
 	opts := Options{
 		WorkspaceRoot: ws, GitRoot: ws, JJRoot: ws,
-		ConfigData:     []byte("servers:\n  a:\n    type: local\n    command: [/bin/true]\n  a__b:\n    type: local\n    command: [/bin/true]\n"),
-		ConfigOrigin:   "test:",
+		Source:         config.Source{Data: []byte("servers:\n  a:\n    type: local\n    command: [/bin/true]\n  a__b:\n    type: local\n    command: [/bin/true]\n"), Origin: "test:"},
 		ServeTransport: serverTransport,
 		NativeEnv:      []string{"PATH=/usr/bin:/bin"},
 		StateDir:       t.TempDir(),
