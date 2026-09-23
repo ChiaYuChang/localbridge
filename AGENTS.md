@@ -67,9 +67,9 @@
 
 ## Active State & In-Flight Context
 
-- **Observed-At**: `2026-09-24T03:50:17Z - --test stdio sealed; working clean`
+- **Observed-At**: `2026-09-24T04:05:46Z - CI-bins sealed; working clean`
 - **Dirty Status**: `clean`
-- **Milestone**: `COMMIT_SEALED - feat(test): --test stdio serve mode; local only, no push`
-- **Next Pickup Item**: `CI-bins build (PLAN_PASS r2); config-defaults parked`
+- **Milestone**: `COMMIT_SEALED - feat(ci): release bins on version tags; local only, no tag/push`
+- **Next Pickup Item**: `config-defaults (~/.config/localbridge) plan; first tag run = bins acceptance`
 - **Commit Ordering Rule**: All `AGENTS.md` content updates land PRE-seal. `Observed-At` carries timestamp + sealed message only, never commit hashes (hashes mutate on squash and live authoritatively in `jj log`); no post-seal squash cycle exists.
 - **Ground Truth Revalidation Invariant**: Cold-start Planners MUST run fresh VCS status/log inspection; never trust cached Active State.
