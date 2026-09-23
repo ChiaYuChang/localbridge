@@ -15,7 +15,9 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"sync"
+	"time"
 
 	"github.com/ChiaYuChang/local-mcp/internal/config"
 	"github.com/ChiaYuChang/local-mcp/internal/installer"
@@ -105,6 +107,8 @@ func (c *cachedSession) Tools(context.Context) ([]mcp.Tool, error) {
 // direct exec (tests inject fakes — no network). Source is the single
 // config-source value: empty Path means stdin/empty bootstrap (admin
 // mutating tools hard-error, reads serve composed Data).
+// CheckResolve/CheckRun nil select the production installer seam and
+// the fixed-budget probe runner (tests inject fakes).
 type Options struct {
 	WorkspaceRoot  string
 	GitRoot        string
@@ -119,6 +123,8 @@ type Options struct {
 	OnListChanged  func(context.Context, *mcp.ToolListChangedRequest)
 	StateDir       string
 	InstallRunner  installer.Runner
+	CheckResolve   func(string) (string, error)
+	CheckRun       func(ctx context.Context, path string, args []string) (string, error)
 }
 
 // Gateway is the composed serving core: upstream server, proxy, sessions
@@ -152,8 +158,8 @@ func (g *Gateway) Unavailable() map[string]string {
 // nativeTools is the FROZEN native set through the single registry path:
 // 8 filesystem + 4 git + 4 jj + echo (RETAINED ToolEcho implementation,
 // registered like any native — no second registration path, echo joins
-// the uniqueness check) + 5 admin (restart-loaded gateway.yaml mutation,
-// redacted reads, atomic 0600 writes; no delete path).
+// the uniqueness check) + 6 admin (restart-loaded gateway.yaml mutation,
+// redacted reads, installer check, atomic 0600 writes; no delete path).
 func nativeTools(fs *filesystem.FileSystem, g *git.Git, j *jj.JJ, h *secrets.SecretHider, a admin.Admin) []tools.Tool {
 	out := filesystem.NativeTools(fs, h)
 	out = append(out, git.NativeTools(g, h)...)
@@ -255,7 +261,23 @@ func Compose(ctx context.Context, opts Options) (*Gateway, error) {
 		sopts = &mcp.ServerOptions{PageSize: opts.PageSize}
 	}
 	upstream := mcp.NewServer(&mcp.Implementation{Name: "local-mcp-gateway", Version: "0.0.1"}, sopts)
-	natives := nativeTools(fs, g, j, h, admin.Admin{Source: config.Source{Origin: opts.Source.Origin, Data: snapData, Path: opts.Source.Path}})
+	// Admin installer-check wiring: scrubbed-PATH resolution via the
+	// installer seam; version probes via direct exec (no shell,
+	// absolute resolved paths only). Test overrides ride CheckResolve/
+	// CheckRun; production always lands on the defaults below.
+	resolve := opts.CheckResolve
+	if resolve == nil {
+		resolve = inst.ResolveManager
+	}
+	checkRun := opts.CheckRun
+	if checkRun == nil {
+		checkRun = defaultCheckRun
+	}
+	natives := nativeTools(fs, g, j, h, admin.Admin{
+		Source:  config.Source{Origin: opts.Source.Origin, Data: snapData, Path: opts.Source.Path},
+		Resolve: resolve,
+		Run:     checkRun,
+	})
 	nativeNames := make([]string, 0, len(natives))
 	for _, t := range natives {
 		nativeNames = append(nativeNames, t.Name())
@@ -386,6 +408,24 @@ func Compose(ctx context.Context, opts Options) (*Gateway, error) {
 		fs: fs, git: g, jj: j, transport: opts.ServeTransport,
 		unavailable: unavailable,
 	}, nil
+}
+
+// checkProbeTimeout is the FIXED version-probe budget for
+// admin_check_installer children. Var (not const) so tests can
+// shrink it against a ctx-blocking stub; production default 10s.
+var checkProbeTimeout = 10 * time.Second
+
+// defaultCheckRun executes one version probe: direct exec (no shell,
+// absolute resolved path), secret-free baseline env (HOME carried,
+// zero secret keys — a manager printing env must never leak tunnel
+// credentials through the tool), FIXED checkProbeTimeout budget.
+func defaultCheckRun(ctx context.Context, path string, args []string) (string, error) {
+	ctx, cancel := context.WithTimeout(ctx, checkProbeTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, path, args...)
+	cmd.Env = config.BuildEnv(os.Environ(), nil)
+	out, err := cmd.CombinedOutput()
+	return string(out), err
 }
 
 // Serve begins serving the injected upstream transport (blocking).

@@ -94,10 +94,17 @@ type Installer struct {
 	root     string
 	runner   Runner
 	lookPath func(string) (string, error)
+	stat     func(string) error
 	timeouts map[Manager]time.Duration
 	// pathEnv overrides PATH for manager resolution (tests only;
 	// production reads the process environment).
 	pathEnv string
+}
+
+// osStatFile reports presence of path (nil = present).
+func osStatFile(path string) error {
+	_, err := os.Stat(path)
+	return err
 }
 
 // New builds an Installer over root (bin/ + state.json + cache/
@@ -108,6 +115,7 @@ func New(root string, runner Runner, lookPath func(string) (string, error)) *Ins
 		root:     root,
 		runner:   runner,
 		lookPath: lookPath,
+		stat:     osStatFile,
 		timeouts: DefaultTimeouts(),
 	}
 	if in.runner == nil {
@@ -156,6 +164,13 @@ func (in *Installer) resolve(name string) (string, error) {
 		}
 	}
 	return "", fmt.Errorf("manager %q not found in scrubbed PATH", name)
+}
+
+// ResolveManager exposes manager resolution over the lookPath seam
+// (scrubbed-PATH default preserved) for admin observability. No
+// execution, absolute path or error only.
+func (in *Installer) ResolveManager(name string) (string, error) {
+	return in.lookPath(name)
 }
 
 // BinDir is the converged executables dir. CacheDir holds toolchain
@@ -217,11 +232,18 @@ func (in *Installer) argv(spec Spec) []string {
 	}
 }
 
+// containerRustupDir is the image-pinned Rust toolchain root. Present
+// (container) -> pin RUSTUP_HOME at it; absent (host) -> omit the
+// override so the host user toolchain resolves via passthrough HOME.
+const containerRustupDir = "/opt/mcp/rustup"
+
 // env builds the sanitized child env: G1 baseline passthrough plus
 // per-manager cache/toolchain homes pinned under CacheDir (HOME=/tmp
 // image contract respected — nothing assumes a writable HOME), with
 // PATH scrubbed of state-root entries (bin-first shadowing would let
-// installed shims hijack manager subprocess resolution).
+// installed shims hijack manager subprocess resolution). RUSTUP_HOME
+// pins only when the container dir is present (stat seam, tests
+// inject); CARGO_HOME stays cache-pinned on both planes.
 func (in *Installer) env(base []string) []string {
 	c := in.CacheDir()
 	extra := map[string]string{
@@ -230,11 +252,17 @@ func (in *Installer) env(base []string) []string {
 		"UV_TOOL_DIR":      filepath.Join(c, "uvtools"),
 		"UV_TOOL_BIN_DIR":  in.BinDir(),
 		"CARGO_HOME":       filepath.Join(c, "cargo"),
-		"RUSTUP_HOME":      "/opt/mcp/rustup",
 		"GOBIN":            in.BinDir(),
 		"GOCACHE":          filepath.Join(c, "go", "build"),
 		"GOMODCACHE":       filepath.Join(c, "go", "mod"),
 		"GOPATH":           filepath.Join(c, "go", "path"),
+	}
+	stat := in.stat
+	if stat == nil {
+		stat = osStatFile
+	}
+	if stat(containerRustupDir) == nil {
+		extra["RUSTUP_HOME"] = containerRustupDir
 	}
 	env := config.BuildEnv(base, extra)
 	for i, kv := range env {

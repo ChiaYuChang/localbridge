@@ -9,6 +9,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/ChiaYuChang/local-mcp/internal/config"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
@@ -395,5 +396,113 @@ func TestGetSlimProfilesEmptyArray(t *testing.T) {
 	}
 	if text := textOf(t, res); !strings.Contains(text, `"profiles": []`) {
 		t.Fatalf("text must contain empty profiles array: %q", text)
+	}
+}
+
+func checkAdmin(resolve func(string) (string, error), run func(context.Context, string, []string) (string, error)) Admin {
+	return Admin{Source: config.Source{}, Resolve: resolve, Run: run}
+}
+
+func okResolve(name string) (string, error) { return "/sys/" + name, nil }
+
+// Found/absent matrix: raw first-line passthrough per frozen argv,
+// absent manager -> found:false shape, exec failure -> error text.
+func TestCheckInstallerMatrix(t *testing.T) {
+	var gotPaths []string
+	var gotArgs [][]string
+	resolve := func(name string) (string, error) {
+		if name == "uv" {
+			return "", errors.New(`manager "uv" not found in scrubbed PATH`)
+		}
+		return okResolve(name)
+	}
+	run := func(_ context.Context, path string, args []string) (string, error) {
+		gotPaths = append(gotPaths, path)
+		gotArgs = append(gotArgs, append([]string{}, args...))
+		switch {
+		case strings.HasSuffix(path, "/npm"):
+			return "10.9.3\nnpm notice extra\n", nil
+		case strings.HasSuffix(path, "/cargo"):
+			return "", errors.New("cargo died: exit status 1")
+		default:
+			return "go version go1.24.0 linux/amd64\n", nil
+		}
+	}
+	tool := ToolAdminCheckInstaller{admin: checkAdmin(resolve, run)}
+	_, out, err := tool.handle(context.Background(), nil, ToolAdminCheckInstallerI{})
+	if err != nil {
+		t.Fatalf("check must always succeed at tool level: %v", err)
+	}
+	// Frozen argv asserted per call (absolute path + version flag).
+	wantArgs := map[string][]string{
+		"/sys/npm": {"--version"}, "/sys/cargo": {"--version"}, "/sys/go": {"version"},
+	}
+	if len(gotPaths) != 3 {
+		t.Fatalf("uv absent must not run: paths %q", gotPaths)
+	}
+	for i, p := range gotPaths {
+		if !slices.Equal(gotArgs[i], wantArgs[p]) {
+			t.Fatalf("argv %s: got %q", p, gotArgs[i])
+		}
+	}
+	// Raw first-line passthrough, no parsing.
+	if m := out.Managers["npm"]; !m.Found || m.Path != "/sys/npm" || m.Version != "10.9.3" {
+		t.Fatalf("npm raw passthrough: %+v", m)
+	}
+	if m := out.Managers["go"]; !m.Found || m.Version != "go version go1.24.0 linux/amd64" {
+		t.Fatalf("go raw passthrough: %+v", m)
+	}
+	// Absent manager -> found:false shape.
+	if m := out.Managers["uv"]; m.Found || m.Path != "" || m.Error == "" {
+		t.Fatalf("uv absent shape: %+v", m)
+	}
+	// Exec failure -> found:false + error text, path kept.
+	if m := out.Managers["cargo"]; m.Found || m.Path != "/sys/cargo" || !strings.Contains(m.Error, "cargo died") {
+		t.Fatalf("cargo failure shape: %+v", m)
+	}
+	// All four managers always present as keys.
+	for _, name := range []string{"npm", "uv", "cargo", "go"} {
+		if _, ok := out.Managers[name]; !ok {
+			t.Fatalf("missing manager key %q", name)
+		}
+	}
+}
+
+func TestCheckInstallerNoSeam(t *testing.T) {
+	tool := ToolAdminCheckInstaller{admin: Admin{Source: config.Source{}}}
+	if _, _, err := tool.handle(context.Background(), nil, ToolAdminCheckInstallerI{}); err == nil {
+		t.Fatalf("nil seam must fail closed")
+	} else if !errors.Is(err, ErrCheckUnavailable) {
+		t.Fatalf("want ErrCheckUnavailable, got %v", err)
+	}
+	half := ToolAdminCheckInstaller{admin: checkAdmin(okResolve, nil)}
+	if _, _, err := half.handle(context.Background(), nil, ToolAdminCheckInstallerI{}); err == nil {
+		t.Fatalf("half seam must fail closed")
+	}
+}
+
+// Timeout boundedness: a runner blocking on ctx must surface as error
+// text within the bound (gateway wires FIXED 10s; here a 50ms ctx
+// proves the error path without waiting out production budgets).
+func TestCheckInstallerRunError(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	block := func(ctx context.Context, _ string, _ []string) (string, error) {
+		<-ctx.Done()
+		return "", ctx.Err()
+	}
+	tool := ToolAdminCheckInstaller{admin: checkAdmin(okResolve, block)}
+	start := time.Now()
+	_, out, err := tool.handle(ctx, nil, ToolAdminCheckInstallerI{})
+	if err != nil {
+		t.Fatalf("tool level must succeed: %v", err)
+	}
+	if elapsed := time.Since(start); elapsed > 10*time.Second {
+		t.Fatalf("unbounded wait: %v", elapsed)
+	}
+	for _, name := range []string{"npm", "uv", "cargo", "go"} {
+		if m := out.Managers[name]; m.Found || m.Error == "" {
+			t.Fatalf("%s must carry ctx error text: %+v", name, m)
+		}
 	}
 }

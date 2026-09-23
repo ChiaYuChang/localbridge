@@ -1,6 +1,7 @@
 package admin
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"slices"
@@ -10,13 +11,17 @@ import (
 	"github.com/ChiaYuChang/local-mcp/internal/tools"
 )
 
-// Admin is the shared root for the five restart-loaded admin natives.
+// Admin is the shared root for the six restart-loaded admin natives.
 // Source is the single config-source value: Path is the instance
 // gateway.yaml path ("" = stdin/empty bootstrap, mutation disabled),
 // Data holds composed bytes (the snapshot). Reads prefer the file
-// when Path is readable, else Data.
+// when Path is readable, else Data. Resolve/Run back
+// admin_check_installer (nil = check unavailable; gateway wires the
+// installer seam + 10s-timeout runner, tests inject fakes).
 type Admin struct {
-	Source config.Source
+	Source  config.Source
+	Resolve func(string) (string, error)
+	Run     func(ctx context.Context, path string, args []string) (string, error)
 }
 
 var (
@@ -101,14 +106,15 @@ func (a Admin) mutate(target string, fn func(*config.GatewayConfig) error) error
 	return nil
 }
 
-// NativeTools returns the five admin natives sharing one Admin root:
-// list / get / get_details / set_enabled / upsert (no delete path —
-// server removal is operator volume reset only).
+// NativeTools returns the six admin natives sharing one Admin root:
+// list / get / get_details / check_installer / set_enabled / upsert
+// (no delete path — server removal is operator volume reset only).
 func NativeTools(a Admin) []tools.Tool {
 	return []tools.Tool{
 		ToolAdminListServers{admin: a},
 		ToolAdminGetServer{admin: a},
 		ToolAdminGetServerDetails{admin: a},
+		ToolAdminCheckInstaller{admin: a},
 		ToolAdminSetServerEnabled{admin: a},
 		ToolAdminUpsertServer{admin: a},
 	}

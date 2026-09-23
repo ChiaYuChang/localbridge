@@ -181,7 +181,7 @@ var frozenNatives = []string{
 	"jj_status", "jj_diff", "jj_log", "jj_show",
 	"echo",
 	"admin_list_servers", "admin_get_server", "admin_get_server_details",
-	"admin_set_server_enabled", "admin_upsert_server",
+	"admin_check_installer", "admin_set_server_enabled", "admin_upsert_server",
 }
 
 func TestComposeBijection(t *testing.T) {
@@ -811,17 +811,19 @@ func TestRealSmoke(t *testing.T) {
 	}
 }
 
-func TestAdminRegistry22(t *testing.T) {
-	// 22 natives registered (17 + 5 admin) via single registry.
+func TestAdminRegistry23(t *testing.T) {
+	// 23 natives registered (17 + 6 admin) via single registry.
+	// Check-tool behavior rides hermetic tests below (no host-PATH
+	// dependence here).
 	ws := fixtureWorkspace(t)
 	_, cs, _ := serveGateway(t, ws, []byte("servers: {}"), nil, map[string]*fakeSession{}, nil)
 	got := clientTools(t, cs)
-	if len(got) != 22 {
-		t.Fatalf("registry = %d, want 22 in %q", len(got), got)
+	if len(got) != 23 {
+		t.Fatalf("registry = %d, want 23 in %q", len(got), got)
 	}
 	for _, n := range []string{
 		"admin_list_servers", "admin_get_server", "admin_get_server_details",
-		"admin_set_server_enabled", "admin_upsert_server",
+		"admin_check_installer", "admin_set_server_enabled", "admin_upsert_server",
 	} {
 		if !slices.Contains(got, n) {
 			t.Fatalf("missing admin native %q in %q", n, got)
@@ -829,8 +831,90 @@ func TestAdminRegistry22(t *testing.T) {
 	}
 }
 
-func TestAdminRestartBoundaryFreshCompose(t *testing.T) {
-	// True fresh-Compose proof, no container: mutate via admin tool,
+func TestCheckInstallerWiringMarkers(t *testing.T) {
+	// Hermetic: composed gateway with fake Resolve/Run; tool output
+	// must carry the observable markers with frozen argv (no
+	// host-PATH dependence).
+	var paths []string
+	var argvs [][]string
+	ws := fixtureWorkspace(t)
+	_, cs, _ := serveGateway(t, ws, []byte("servers: {}"), nil, map[string]*fakeSession{},
+		func(o *Options) {
+			o.CheckResolve = func(name string) (string, error) { return "/fake/bin/" + name, nil }
+			o.CheckRun = func(_ context.Context, path string, args []string) (string, error) {
+				paths = append(paths, path)
+				argvs = append(argvs, append([]string{}, args...))
+				return "marker " + path + "\nsecond line\n", nil
+			}
+		})
+	res := clientCall(t, cs, "admin_check_installer", nil)
+	text := clientText(t, res)
+	wantArgs := map[string][]string{
+		"/fake/bin/npm": {"--version"}, "/fake/bin/uv": {"--version"},
+		"/fake/bin/cargo": {"--version"}, "/fake/bin/go": {"version"},
+	}
+	if len(paths) != 4 {
+		t.Fatalf("all four managers must run: %q", paths)
+	}
+	for i, p := range paths {
+		if !slices.Equal(argvs[i], wantArgs[p]) {
+			t.Fatalf("argv %s: got %q want %q", p, argvs[i], wantArgs[p])
+		}
+		if !strings.Contains(text, "marker "+p) {
+			t.Fatalf("marker missing for %s: %q", p, text)
+		}
+	}
+}
+
+func TestCheckProbeTimeoutFixed(t *testing.T) {
+	// Deadline contract, const+plumbing split: the budget constant is
+	// exactly 10s (change fails here); ctx-error surfacing is proven
+	// at the tool level (TestCheckInstallerRunError) and the success
+	// path below exercises the real default runner.
+	if checkProbeTimeout != 10*time.Second {
+		t.Fatalf("probe budget = %v, want 10s", checkProbeTimeout)
+	}
+	// Success path through the real default runner (hermetic script,
+	// no host binary dependence).
+	script := "#!/bin/sh\necho hi\n"
+	p := filepath.Join(t.TempDir(), "probe")
+	if err := os.WriteFile(p, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	out, err := defaultCheckRun(context.Background(), p, []string{"ignored"})
+	if err != nil || out != "hi\n" {
+		t.Fatalf("default runner: %q %v", out, err)
+	}
+}
+
+func TestCheckProbeDeadlineBounded(t *testing.T) {
+	// Falsifiable deadline: shrink the budget to 50ms against a
+	// ctx-blocking stub; the run must error within a tight elapsed
+	// window. A WithCancel-overlay (no deadline) sleeps the full 30s
+	// and fails the bound below. No 10s sleep anywhere.
+	old := checkProbeTimeout
+	checkProbeTimeout = 50 * time.Millisecond
+	defer func() { checkProbeTimeout = old }()
+	// exec-form: the shell replaces itself with sleep so the deadline
+	// kill closes the stdout pipe too (a forked sleep would orphan
+	// the pipe and block CombinedOutput past the kill).
+	script := "#!/bin/sh\nexec sleep 30\n"
+	p := filepath.Join(t.TempDir(), "blocker")
+	if err := os.WriteFile(p, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	start := time.Now()
+	_, err := defaultCheckRun(context.Background(), p, nil)
+	elapsed := time.Since(start)
+	if err == nil {
+		t.Fatalf("blocked probe must error")
+	}
+	if elapsed > 10*time.Second {
+		t.Fatalf("deadline not enforced: %v", elapsed)
+	}
+}
+
+func TestAdminRestartBoundaryFreshCompose(t *testing.T) { // True fresh-Compose proof, no container: mutate via admin tool,
 	// read mutated file bytes, run a NEW Compose with those bytes as
 	// Source.Data + stub DialSession; assert composed tool set reflects
 	// the edit (disabled server absent, added server present).
@@ -885,5 +969,41 @@ func TestAdminRestartBoundaryFreshCompose(t *testing.T) {
 	}
 	if !slices.Contains(got, "d3__gamma") {
 		t.Fatalf("added d3 tool missing in %q", got)
+	}
+}
+
+func TestCheckInstallerNoSecretLeak(t *testing.T) {
+	// Track A RED: version-probe children inherit ambient env in the
+	// pre-fix wiring, so a manager printing env leaks OPENAI_API_KEY
+	// through the tool. Deterministic: fake scripts for ALL four
+	// managers prepended (no real host binary exec, no inherited-PATH
+	// dependence); the planted key must not surface while HOME still
+	// carries through.
+	dir := t.TempDir()
+	script := "#!/bin/sh\necho \"HOME=$HOME KEY=$OPENAI_API_KEY\"\n"
+	for _, name := range []string{"npm", "uv", "cargo", "go"} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(script), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("OPENAI_API_KEY", "leakprobe-planted")
+	t.Setenv("HOME", "/home/tester")
+	ws := fixtureWorkspace(t)
+	_, cs, _ := serveGateway(t, ws, []byte("servers: {}"), nil, map[string]*fakeSession{}, nil)
+	res := clientCall(t, cs, "admin_check_installer", nil)
+	text := clientText(t, res)
+	if strings.Contains(text, "leakprobe-planted") {
+		t.Fatalf("probe child leaked secret: %q", text)
+	}
+	if !strings.Contains(text, "HOME=/home/tester") {
+		t.Fatalf("HOME must carry to probe child: %q", text)
+	}
+	// Scrubbed-PATH resolution proven via fakes: every manager
+	// resolves under the planted dir, never a system binary.
+	for _, name := range []string{"npm", "uv", "cargo", "go"} {
+		if !strings.Contains(text, filepath.Join(dir, name)) {
+			t.Fatalf("fake %s path missing: %q", name, text)
+		}
 	}
 }

@@ -81,6 +81,7 @@ func TestArgvShapes(t *testing.T) {
 func TestEnvHomes(t *testing.T) {
 	root := t.TempDir()
 	in := New(root, nil, nil)
+	in.stat = func(string) error { return nil } // container present
 	env := in.env([]string{"PATH=/bin", "HOME=/tmp", "OPENAI_API_KEY=sekrit", "MALFORMED"})
 	for _, kv := range env {
 		if strings.HasPrefix(kv, "OPENAI_") {
@@ -113,6 +114,61 @@ func TestEnvHomes(t *testing.T) {
 		if get(k) != want {
 			t.Fatalf("env %s: got %q want %q", k, get(k), want)
 		}
+	}
+}
+
+// RUSTUP_HOME host parity via the stat seam: pinned when the
+// container dir is present, omitted on hosts (user toolchain resolves
+// via passthrough HOME, which the baseline already carries).
+func TestEnvRustupHome(t *testing.T) {
+	get := func(env []string, k string) (string, bool) {
+		for _, kv := range env {
+			if v, ok := strings.CutPrefix(kv, k+"="); ok {
+				return v, true
+			}
+		}
+		return "", false
+	}
+	newIn := func(stat func(string) error) *Installer {
+		in := New(t.TempDir(), nil, nil)
+		in.stat = stat
+		return in
+	}
+	present := func(string) error { return nil }
+	absent := func(string) error { return errFake }
+
+	if v, ok := get(newIn(present).env([]string{"PATH=/bin", "HOME=/tmp"}), "RUSTUP_HOME"); !ok || v != "/opt/mcp/rustup" {
+		t.Fatalf("present must pin: %q %v", v, ok)
+	}
+	env := newIn(absent).env([]string{"PATH=/bin", "HOME=/home/u"})
+	if _, ok := get(env, "RUSTUP_HOME"); ok {
+		t.Fatalf("absent must omit override: %q", env)
+	}
+	if v, ok := get(env, "HOME"); !ok || v != "/home/u" {
+		t.Fatalf("host HOME must carry through: %q", env)
+	}
+}
+
+// ResolveManager is the exported lookPath seam: success passes the
+// absolute path through, absence errors.
+func TestResolveManager(t *testing.T) {
+	in := New(t.TempDir(), nil, func(name string) (string, error) {
+		if name == "npm" {
+			return "/sys/npm", nil
+		}
+		return "", errFake
+	})
+	if got, err := in.ResolveManager("npm"); err != nil || got != "/sys/npm" {
+		t.Fatalf("found: %q %v", got, err)
+	}
+	if _, err := in.ResolveManager("go"); err == nil {
+		t.Fatalf("absent must fail")
+	}
+	// Default (nil seam) resolves over the scrubbed PATH.
+	def := New(t.TempDir(), nil, nil)
+	def.pathEnv = t.TempDir() // empty dir: nothing resolvable
+	if _, err := def.ResolveManager("npm"); err == nil {
+		t.Fatalf("empty PATH must fail")
 	}
 }
 

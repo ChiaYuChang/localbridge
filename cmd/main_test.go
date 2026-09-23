@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -176,5 +177,150 @@ func TestHeadersFromEnvironmentRejectsMalformedEntry(t *testing.T) {
 	_, err := headersFromEnvironment("OPENAI_TUNNEL_EXTRA_HEADERS")
 	if err == nil {
 		t.Fatal("expected malformed header error")
+	}
+}
+
+func TestCheckNoArgs(t *testing.T) {
+	if err := checkNoArgs(nil); err != nil {
+		t.Fatalf("no args must pass: %v", err)
+	}
+	if err := checkNoArgs([]string{}); err != nil {
+		t.Fatalf("empty args must pass: %v", err)
+	}
+	if err := checkNoArgs([]string{"serve"}); err == nil || !strings.Contains(err.Error(), "serve") {
+		t.Fatalf("positional must fail naming value, got %v", err)
+	}
+	if err := checkNoArgs([]string{"a", "b"}); err == nil || !strings.Contains(err.Error(), "a") {
+		t.Fatalf("multi positional must fail, got %v", err)
+	}
+}
+
+func TestResolveWorkspaceRoot(t *testing.T) {
+	cwd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	file := filepath.Join(dir, "f.txt")
+	if err := os.WriteFile(file, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cases := []struct {
+		name    string
+		flagVal string
+		envVal  string
+		want    string
+		wantErr string
+	}{
+		{"flag wins", dir, cwd, dir, ""},
+		{"env fallback", "", dir, dir, ""},
+		{"default cwd", "", "", cwd, ""},
+		{"missing dir", filepath.Join(dir, "nope"), "", "", "nope"},
+		{"file not dir", file, "", "", "not a directory"},
+	}
+	for _, c := range cases {
+		got, err := resolveWorkspaceRoot(c.flagVal, c.envVal)
+		if c.wantErr != "" {
+			if err == nil {
+				t.Errorf("%s: want error", c.name)
+				continue
+			}
+			// Fail-closed names the offending value (or the cwd default).
+			if !strings.Contains(err.Error(), c.wantErr) && !strings.Contains(err.Error(), c.flagVal+c.envVal) {
+				t.Errorf("%s: error must name value, got %v", c.name, err)
+			}
+			continue
+		}
+		if err != nil {
+			t.Errorf("%s: %v", c.name, err)
+			continue
+		}
+		if got != c.want {
+			t.Errorf("%s: got %q want %q", c.name, got, c.want)
+		}
+		if !filepath.IsAbs(got) {
+			t.Errorf("%s: must be absolute: %q", c.name, got)
+		}
+	}
+}
+
+func TestResolveStateDir(t *testing.T) {
+	home := t.TempDir()
+	failProbe := func(string) error { return errors.New("denied") }
+	var probed []string
+	rec := func(dir string) error {
+		probed = append(probed, dir)
+		return nil
+	}
+
+	// Flag > env > auto precedence; explicit values used verbatim
+	// (probe untouched).
+	if got, err := resolveStateDir("/flag/dir", "/env/dir", home, failProbe); err != nil || got != "/flag/dir" {
+		t.Fatalf("flag wins: %q %v", got, err)
+	}
+	if got, err := resolveStateDir("  ", "/env/dir", home, failProbe); err != nil || got != "/env/dir" {
+		t.Fatalf("env fallback: %q %v", got, err)
+	}
+	if got, err := resolveStateDir("", "", home, rec); err != nil || got != "/var/lib/mcp" {
+		t.Fatalf("auto prefers system dir: %q %v", got, err)
+	}
+	if len(probed) != 1 || probed[0] != "/var/lib/mcp" {
+		t.Fatalf("auto must probe system first only: %q", probed)
+	}
+
+	// System unwritable -> $HOME fallback.
+	sysFail := func(dir string) error {
+		if dir == "/var/lib/mcp" {
+			return errors.New("denied")
+		}
+		return nil
+	}
+	wantHome := filepath.Join(home, ".local", "share", "localbridge")
+	if got, err := resolveStateDir("", "", home, sysFail); err != nil || got != wantHome {
+		t.Fatalf("home fallback: %q %v", got, err)
+	}
+
+	// Both candidates unwritable -> hard error naming paths.
+	if _, err := resolveStateDir("", "", home, failProbe); err == nil {
+		t.Fatalf("both-fail must hard-error")
+	} else if !strings.Contains(err.Error(), "/var/lib/mcp") || !strings.Contains(err.Error(), wantHome) {
+		t.Fatalf("error must name both candidates, got %v", err)
+	}
+}
+
+func TestProbeStateDir(t *testing.T) {
+	// Creatable missing dir passes (MkdirAll + write probe).
+	missing := filepath.Join(t.TempDir(), "new", "state")
+	if err := probeStateDir(missing); err != nil {
+		t.Fatalf("creatable dir must pass: %v", err)
+	}
+	if fi, err := os.Stat(missing); err != nil || !fi.IsDir() {
+		t.Fatalf("probe must create dir: %v", err)
+	}
+
+	// File-occupied path fails.
+	occupied := filepath.Join(t.TempDir(), "file")
+	if err := os.WriteFile(occupied, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := probeStateDir(occupied); err == nil {
+		t.Fatalf("file-occupied path must fail")
+	}
+
+	// Mode-0555 unwritable dir fails (EUID-root guard: root writes
+	// through permission bits, so skip there).
+	if os.Geteuid() == 0 {
+		t.Skip("root bypasses mode bits")
+	}
+	locked := filepath.Join(t.TempDir(), "locked")
+	if err := os.MkdirAll(locked, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(locked, 0o555); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(locked, 0o755) })
+	if err := probeStateDir(locked); err == nil {
+		t.Fatalf("unwritable dir must fail")
 	}
 }

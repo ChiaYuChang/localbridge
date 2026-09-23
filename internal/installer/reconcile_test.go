@@ -294,3 +294,82 @@ func TestReconcileMissingBinaryReinstalls(t *testing.T) {
 		t.Fatalf("missing binary must reinstall: %d", f.calls)
 	}
 }
+
+func absentManagerInstaller(t *testing.T, f *fakeRunner) *Installer {
+	t.Helper()
+	root := t.TempDir()
+	f.root = root
+	return New(root, f.run, func(string) (string, error) { return "", errFake })
+}
+
+// Warm server + absent manager: starts with zero manager requirement
+// and zero runner calls (lazy probe sits strictly after the warm
+// receipt+binary check).
+func TestReconcileWarmAbsentManagerZeroCalls(t *testing.T) {
+	f := &fakeRunner{}
+	in := absentManagerInstaller(t, f)
+	cfg, active := loadActive(t, installYAML("a", "npm", "pkg-a", "1.0.0", "npb", ""))
+	bin := filepath.Join(in.BinDir(), "npb")
+	if err := os.MkdirAll(in.BinDir(), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(bin, []byte("x"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := SaveState(in.StatePath(), State{Servers: map[string]Receipt{
+		"a": {Manager: "npm", Package: "pkg-a", RequestedVersion: "1.0.0", Binary: "npb"},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	unav, err := Reconcile(context.Background(), in, cfg, active)
+	if err != nil || len(unav) != 0 {
+		t.Fatalf("warm+absent must serve: %v %v", unav, err)
+	}
+	if f.calls != 0 {
+		t.Fatalf("warm must make zero runner calls: %d", f.calls)
+	}
+}
+
+// Optional server + absent manager: skip-with-reason, zero exec.
+func TestReconcileOptionalAbsentManagerSkips(t *testing.T) {
+	f := &fakeRunner{bins: []string{"b"}}
+	in := absentManagerInstaller(t, f)
+	cfg, active := loadActive(t, installYAML("opt", "npm", "pkg", "", "b", ""))
+	unav, err := Reconcile(context.Background(), in, cfg, active)
+	if err != nil {
+		t.Fatalf("optional must not abort: %v", err)
+	}
+	msg, ok := unav["opt"]
+	if !ok || !strings.Contains(msg, `manager "npm" not found in scrubbed PATH, skipped install`) {
+		t.Fatalf("skip reason: %v", unav)
+	}
+	if f.calls != 0 {
+		t.Fatalf("skip must attempt zero execs: %d calls", f.calls)
+	}
+	st, _ := LoadState(in.StatePath())
+	if _, ok := st.Servers["opt"]; ok {
+		t.Fatalf("no failed receipts: %+v", st.Servers)
+	}
+}
+
+// Required server + absent manager: abort naming server + manager
+// absence (not an install failure — Install never runs).
+func TestReconcileRequiredAbsentManagerAborts(t *testing.T) {
+	f := &fakeRunner{bins: []string{"b"}}
+	in := absentManagerInstaller(t, f)
+	cfg, active := loadActive(t, installYAML("need", "cargo", "pkg", "", "b", "true"))
+	_, err := Reconcile(context.Background(), in, cfg, active)
+	if err == nil {
+		t.Fatalf("required must abort")
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, `"need"`) || !strings.Contains(msg, `"cargo"`) || !strings.Contains(msg, "not found") {
+		t.Fatalf("abort must name server+manager absence: %q", msg)
+	}
+	if strings.Contains(msg, "install (cargo)") {
+		t.Fatalf("absence is not an install failure: %q", msg)
+	}
+	if f.calls != 0 {
+		t.Fatalf("abort must attempt zero execs: %d calls", f.calls)
+	}
+}

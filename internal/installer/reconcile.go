@@ -2,6 +2,7 @@ package installer
 
 import (
 	"context"
+	"fmt"
 
 	"github.com/ChiaYuChang/local-mcp/internal/config"
 )
@@ -37,6 +38,19 @@ func Reconcile(ctx context.Context, in *Installer, cfg config.GatewayConfig, act
 		}
 		if rec, found := st.Servers[name]; found && IdentityEqual(spec, rec) && in.BinaryPresent(spec.Binary) {
 			continue // warm: receipt + binary agree, zero network
+		}
+		// Lazy manager presence: probed only when an install is
+		// actually needed (warm servers above never require a manager
+		// at all). Absent manager means skip-with-reason, never an
+		// exec attempt: optional serves without the server, required
+		// aborts naming server + manager absence (not an install
+		// failure — Install is never reached).
+		if _, err := in.lookPath(string(spec.Manager)); err != nil {
+			if scfg.Required {
+				return nil, fmt.Errorf("server %q: manager %q not found in scrubbed PATH, required install aborted: %w", name, spec.Manager, err)
+			}
+			unavailable[name] = fmt.Sprintf("manager %q not found in scrubbed PATH, skipped install", spec.Manager)
+			continue
 		}
 		rec, err := in.Install(ctx, name, spec)
 		if err != nil {

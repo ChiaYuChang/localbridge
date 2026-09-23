@@ -8,6 +8,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
@@ -25,15 +26,34 @@ import (
 
 const readyFileEnv = "TUNNEL_CLIENT_SDK_READY_FILE"
 
+// stateDirEnv overrides the auto state-dir resolution.
+const stateDirEnv = "LOCALBRIDGE_STATE_DIR"
+
 func main() {
 	configPath := flag.String("config", "", "gateway config file path ('-' reads stdin; empty serves natives only)")
-	stateDir := flag.String("state-dir", installer.DefaultStateDir, "installer state root (bin/ + state.json + cache/)")
+	stateDirFlag := flag.String("state-dir", "", "installer state root (bin/ + state.json + cache/); default auto: "+installer.DefaultStateDir+" when writable, else $HOME/.local/share/localbridge")
+	workspaceFlag := flag.String("path", "", "workspace root (default flag > WORKSPACE_ROOT env > cwd)")
 	var profiles profileFlags
 	flag.Var(&profiles, "profile", "active profile (repeatable)")
 	flag.Parse()
+	if err := checkNoArgs(flag.Args()); err != nil {
+		log.Fatal(err)
+	}
+	workspaceRoot, err := resolveWorkspaceRoot(*workspaceFlag, os.Getenv("WORKSPACE_ROOT"))
+	if err != nil {
+		log.Fatal(err)
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		log.Fatalf("home dir: %v", err)
+	}
+	stateDir, err := resolveStateDir(strings.TrimSpace(*stateDirFlag), os.Getenv(stateDirEnv), home, probeStateDir)
+	if err != nil {
+		log.Fatal(err)
+	}
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
-	if err := run(ctx, *configPath, *stateDir, profiles); err != nil {
+	if err := run(ctx, *configPath, stateDir, workspaceRoot, profiles); err != nil {
 		log.Fatal(err)
 	}
 }
@@ -47,7 +67,81 @@ func (p *profileFlags) Set(v string) error {
 	return nil
 }
 
-func run(ctx context.Context, configPath, stateDir string, profiles []string) error {
+// checkNoArgs fails closed on unknown positional arguments (the flag
+// parser silently ignores them otherwise).
+func checkNoArgs(args []string) error {
+	if len(args) > 0 {
+		return fmt.Errorf("unknown argument(s): %q", strings.Join(args, " "))
+	}
+	return nil
+}
+
+// resolveWorkspaceRoot implements flag > WORKSPACE_ROOT env > cwd,
+// absolutized with an existing-dir gate (fail-closed naming value).
+func resolveWorkspaceRoot(flagVal, envVal string) (string, error) {
+	v := flagVal
+	if v == "" {
+		v = envVal
+	}
+	if v == "" {
+		v = "."
+	}
+	abs, err := filepath.Abs(v)
+	if err != nil {
+		return "", fmt.Errorf("workspace root %q: %w", v, err)
+	}
+	fi, err := os.Stat(abs)
+	if err != nil {
+		return "", fmt.Errorf("workspace root %q: %w", v, err)
+	}
+	if !fi.IsDir() {
+		return "", fmt.Errorf("workspace root %q: not a directory", v)
+	}
+	return abs, nil
+}
+
+// resolveStateDir implements --state-dir flag > LOCALBRIDGE_STATE_DIR
+// env > auto (/var/lib/mcp when writable, else
+// $HOME/.local/share/localbridge). The probe both creates and
+// write-tests a candidate (MkdirAll alone cannot detect an existing
+// unwritable dir); it is injected so unit tests never touch real
+// system paths. Both candidates failing is a hard error naming them.
+func resolveStateDir(flagVal, envVal, home string, probe func(string) error) (string, error) {
+	if v := strings.TrimSpace(flagVal); v != "" {
+		return v, nil
+	}
+	if v := strings.TrimSpace(envVal); v != "" {
+		return v, nil
+	}
+	fallback := filepath.Join(home, ".local", "share", "localbridge")
+	if err := probe(installer.DefaultStateDir); err == nil {
+		return installer.DefaultStateDir, nil
+	} else if ferr := probe(fallback); ferr == nil {
+		return fallback, nil
+	} else {
+		return "", fmt.Errorf("no writable state dir (tried %q: %v; tried %q: %w)", installer.DefaultStateDir, err, fallback, ferr)
+	}
+}
+
+// probeStateDir creates dir (if missing) and proves write access with
+// a temp file removed immediately after.
+func probeStateDir(dir string) error {
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
+	f, err := os.CreateTemp(dir, ".writetest-*")
+	if err != nil {
+		return err
+	}
+	name := f.Name()
+	if err := f.Close(); err != nil {
+		_ = os.Remove(name)
+		return err
+	}
+	return os.Remove(name)
+}
+
+func run(ctx context.Context, configPath, stateDir, workspaceRoot string, profiles []string) error {
 	// Bootstrap: config-source acquisition (file/stdin/empty) into one
 	// config.Source value; tunnel credential validation lives ONLY here.
 	var src config.Source
@@ -69,7 +163,8 @@ func run(ctx context.Context, configPath, stateDir string, profiles []string) er
 		src = config.Source{Origin: origin, Data: data, Path: configPath}
 	}
 
-	workspaceRoot := os.Getenv("WORKSPACE_ROOT")
+	// workspaceRoot arrives resolved (flag > env > cwd, absolute
+	// existing dir via resolveWorkspaceRoot in main).
 	if workspaceRoot == "" {
 		workspaceRoot = "."
 	}
