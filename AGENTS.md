@@ -67,9 +67,9 @@
 
 ## Active State & In-Flight Context
 
-- **Observed-At**: `2026-09-24T04:58:24Z - devenv-retire sealed; working clean`
+- **Observed-At**: `2026-09-24T05:24:51Z - pattern-fix sealed; working clean`
 - **Dirty Status**: `clean`
-- **Milestone**: `COMMIT_SEALED - chore(devenv): retire devenv toolchain files; local only, no push`
-- **Next Pickup Item**: `config-defaults plan; runs-on pin split; push+tag when network returns`
+- **Milestone**: `COMMIT_SEALED - fix(ci): scope release download to own bins; local only, no tag/push`
+- **Next Pickup Item**: `Tag v0.10.1 on auth; config-defaults plan; runs-on pin split`
 - **Commit Ordering Rule**: All `AGENTS.md` content updates land PRE-seal. `Observed-At` carries timestamp + sealed message only, never commit hashes (hashes mutate on squash and live authoritatively in `jj log`); no post-seal squash cycle exists.
 - **Ground Truth Revalidation Invariant**: Cold-start Planners MUST run fresh VCS status/log inspection; never trust cached Active State.

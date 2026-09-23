@@ -96,6 +96,9 @@ jobs:
           fi
       - uses: actions/download-artifact@v4
         with:
+          # Scope to our bins: the GHCR job's buildx artifact must never
+          # land in dist/ (4th platform edits pattern + pre-check + matrix).
+          pattern: localbridge-*
           path: dist
           merge-multiple: true
       - name: SHA256SUMS
