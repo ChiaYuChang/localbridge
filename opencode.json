@@ -4,5 +4,16 @@
     "external_directory": {
       "~/.agentplaybook/**": "allow"
     }
+  },
+  "mcp": {
+    "servers": {
+      "localbridge": {
+        "type": "local",
+        "command": [
+          "bin/localbridge",
+          "--test"
+        ]
+      }
+    }
   }
 }

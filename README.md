@@ -180,6 +180,26 @@ never touches `gateway.yaml` (see below).
   `-` for stdin, or empty for natives-only; tunnel credentials via
   `OPENAI_TUNNEL_ID(_FILE)` / `OPENAI_API_KEY(_FILE)` as above.
 
+### Local stdio test mode
+
+`localbridge --test` serves the composed gateway over stdio as a
+plain MCP server — no tunnel, no credentials:
+
+```sh
+localbridge --test --path /srv/repo --config /opt/mcp/config/gateway.yaml
+```
+
+`--config`, `--state-dir`, `--path`, and `--profile` compose exactly
+as in tunnel mode; `--test` with `--config -` is rejected (stdin
+cannot carry both config bytes and MCP frames). Connect any local
+MCP client over the process pipes (`initialize` → `tools/list` →
+`tools/call`), then close stdin for a clean exit.
+
+Stdout-purity contract: in `--test` mode stdout carries MCP frames
+only — logs and diagnostics stay on stderr. The tunnel remains the
+production path; `--test` only downgrades local verification
+difficulty.
+
 ## 6. Trust model (summary)
 
 - Same-container downstreams are operator-trusted: masking and env

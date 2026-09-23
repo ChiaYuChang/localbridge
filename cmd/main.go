@@ -5,6 +5,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"os/signal"
@@ -33,6 +34,7 @@ func main() {
 	configPath := flag.String("config", "", "gateway config file path ('-' reads stdin; empty serves natives only)")
 	stateDirFlag := flag.String("state-dir", "", "installer state root (bin/ + state.json + cache/); default auto: "+installer.DefaultStateDir+" when writable, else $HOME/.local/share/localbridge")
 	workspaceFlag := flag.String("path", "", "workspace root (default flag > WORKSPACE_ROOT env > cwd)")
+	testMode := flag.Bool("test", false, "serve the composed gateway over stdio as a plain MCP server (no tunnel, no credentials)")
 	var profiles profileFlags
 	flag.Var(&profiles, "profile", "active profile (repeatable)")
 	flag.Parse()
@@ -53,7 +55,7 @@ func main() {
 	}
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
-	if err := run(ctx, *configPath, stateDir, workspaceRoot, profiles); err != nil {
+	if err := run(ctx, *configPath, stateDir, workspaceRoot, profiles, *testMode); err != nil {
 		log.Fatal(err)
 	}
 }
@@ -72,6 +74,15 @@ func (p *profileFlags) Set(v string) error {
 func checkNoArgs(args []string) error {
 	if len(args) > 0 {
 		return fmt.Errorf("unknown argument(s): %q", strings.Join(args, " "))
+	}
+	return nil
+}
+
+// checkTestConfigCombo fails closed on --test with --config -: one
+// stream (stdin) cannot carry both config bytes and MCP frames.
+func checkTestConfigCombo(testMode bool, configPath string) error {
+	if testMode && configPath == "-" {
+		return fmt.Errorf("--test cannot be combined with --config %q: stdin carries MCP frames, not config", "-")
 	}
 	return nil
 }
@@ -141,7 +152,12 @@ func probeStateDir(dir string) error {
 	return os.Remove(name)
 }
 
-func run(ctx context.Context, configPath, stateDir, workspaceRoot string, profiles []string) error {
+func run(ctx context.Context, configPath, stateDir, workspaceRoot string, profiles []string, testMode bool) error {
+	// Fail-closed combo BEFORE stdin is read: one stream cannot carry
+	// both config bytes and MCP frames.
+	if err := checkTestConfigCombo(testMode, configPath); err != nil {
+		return err
+	}
 	// Bootstrap: config-source acquisition (file/stdin/empty) into one
 	// config.Source value; tunnel credential validation lives ONLY here.
 	var src config.Source
@@ -175,6 +191,10 @@ func run(ctx context.Context, configPath, stateDir, workspaceRoot string, profil
 	jjRoot, err := jj.ResolveRoot(os.Getenv("JJ_ROOT"), workspaceRoot)
 	if err != nil {
 		return err
+	}
+
+	if testMode {
+		return runTestMode(ctx, src, stateDir, workspaceRoot, gitRoot, jjRoot, profiles)
 	}
 
 	// Caller-created transports (ownership: core serves, never closes).
@@ -238,6 +258,54 @@ func run(ctx context.Context, configPath, stateDir, workspaceRoot string, profil
 		}
 		return fmt.Errorf("MCP server stopped: %w", err)
 	}
+}
+
+// runTestMode serves the composed gateway over stdio as a plain MCP
+// server: no tunnel client, no credential requirement (creds-absent
+// must still serve). Stdout carries MCP frames ONLY (logs stay on
+// stderr); returns clean nil on stdin EOF or signal, serve errors
+// wrapped naming stdio.
+func runTestMode(ctx context.Context, src config.Source, stateDir, workspaceRoot, gitRoot, jjRoot string, profiles []string) error {
+	// SIGPIPE ignored on the stdio branch ONLY (tunnel path untouched):
+	// a closed stdout pipe then surfaces as an EPIPE serve error
+	// (non-zero, stdio-named) instead of taking the process down
+	// mid-session with an empty diagnostic.
+	signal.Ignore(syscall.SIGPIPE)
+	gw, err := gateway.Compose(ctx, gateway.Options{
+		WorkspaceRoot:  workspaceRoot,
+		GitRoot:        gitRoot,
+		JJRoot:         jjRoot,
+		Source:         src,
+		Profiles:       profiles,
+		ServeTransport: &mcp.StdioTransport{},
+		NativeEnv:      config.BuildEnv(os.Environ(), nil),
+		StateDir:       stateDir,
+	})
+	if err != nil {
+		return err
+	}
+	defer gw.Close()
+	if err := gw.Serve(ctx); err == nil || errors.Is(err, context.Canceled) || isStdioEOF(err) {
+		return nil
+	} else {
+		return fmt.Errorf("stdio: %w", err)
+	}
+}
+
+// isStdioEOF maps stdin-EOF shutdown to a clean exit. The SDK reports
+// it as "server is closing: EOF" (its ErrServerClosing type lives in
+// an unimportable internal package), which arrives either as a bare
+// io.EOF or suffixed to the closing verdict — both mean session end,
+// never a serve failure.
+func isStdioEOF(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, io.EOF) {
+		return true
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "server is closing") && strings.HasSuffix(msg, ": "+io.EOF.Error())
 }
 
 // resolveCredential is the SINGLE OWNER of _FILE resolution for the two

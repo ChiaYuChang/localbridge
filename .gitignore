@@ -3,6 +3,9 @@
 devenv.local.nix
 devenv.local.yaml
 
+# built binaries (per-session `go build -o bin/`, never sealed)
+bin/
+
 # env
 .env
 

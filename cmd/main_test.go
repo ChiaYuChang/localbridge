@@ -1,7 +1,12 @@
 package main
 
 import (
+	"bufio"
+	"bytes"
+	"context"
+	"encoding/json"
 	"errors"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -322,5 +327,326 @@ func TestProbeStateDir(t *testing.T) {
 	t.Cleanup(func() { _ = os.Chmod(locked, 0o755) })
 	if err := probeStateDir(locked); err == nil {
 		t.Fatalf("unwritable dir must fail")
+	}
+}
+
+func TestCheckTestConfigCombo(t *testing.T) {
+	if err := checkTestConfigCombo(true, "-"); err == nil {
+		t.Fatalf("--test with --config - must fail")
+	} else if !strings.Contains(err.Error(), "--test") || !strings.Contains(err.Error(), "--config") {
+		t.Fatalf("error must name both flags, got %v", err)
+	}
+	if err := checkTestConfigCombo(true, ""); err != nil {
+		t.Fatalf("test+empty must pass: %v", err)
+	}
+	if err := checkTestConfigCombo(true, "/tmp/c.yaml"); err != nil {
+		t.Fatalf("test+file must pass: %v", err)
+	}
+	if err := checkTestConfigCombo(false, "-"); err != nil {
+		t.Fatalf("tunnel+stdin must pass: %v", err)
+	}
+}
+
+func TestIsStdioEOF(t *testing.T) {
+	if isStdioEOF(nil) {
+		t.Fatalf("nil is not EOF")
+	}
+	if !isStdioEOF(io.EOF) {
+		t.Fatalf("bare EOF must map clean")
+	}
+	if !isStdioEOF(errors.New("server is closing: EOF")) {
+		t.Fatalf("SDK shutdown verdict must map clean")
+	}
+	if isStdioEOF(errors.New("server is closing: broken pipe")) {
+		t.Fatalf("non-EOF shutdown must stay an error")
+	}
+	if isStdioEOF(errors.New("boom")) {
+		t.Fatalf("random error must stay an error")
+	}
+}
+
+// jsonrpcEnvelope is the framesOK shape: envelope version only, never
+// method/result payloads (purity cares that every line IS a frame).
+type jsonrpcEnvelope struct {
+	JSONRPC string `json:"jsonrpc"`
+}
+
+// framesOK reports whether every non-empty line of data unmarshals as
+// a jsonrpc:"2.0" envelope. At least one frame is required (an empty
+// session proves nothing); any junk line fails it.
+func framesOK(data string) bool {
+	seen := false
+	for _, line := range strings.Split(data, "\n") {
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+		var env jsonrpcEnvelope
+		if err := json.Unmarshal([]byte(line), &env); err != nil {
+			return false
+		}
+		if env.JSONRPC != "2.0" {
+			return false
+		}
+		seen = true
+	}
+	return seen
+}
+
+func TestFramesOKDiscriminates(t *testing.T) {
+	good := "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}\n{\"jsonrpc\":\"2.0\",\"method\":\"ping\"}\n"
+	if !framesOK(good) {
+		t.Fatalf("valid frames must pass")
+	}
+	if framesOK("") || framesOK("\n  \n") {
+		t.Fatalf("empty session must fail")
+	}
+	// Canned negative through the SAME helper: one junk line fails.
+	if framesOK(good + "THIS IS NOT JSON\n") {
+		t.Fatalf("junk line must fail")
+	}
+	if framesOK("{\"jsonrpc\":\"1.0\",\"id\":1}\n") {
+		t.Fatalf("wrong version must fail")
+	}
+}
+
+// moduleRoot walks up to go.mod (same pattern as gateway stub builds).
+func moduleRoot(t *testing.T) string {
+	t.Helper()
+	dir, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for {
+		if _, err := os.Stat(filepath.Join(dir, "go.mod")); err == nil {
+			return dir
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			t.Fatalf("go.mod not found above %s", dir)
+		}
+		dir = parent
+	}
+}
+
+func buildLocalbridge(t *testing.T) string {
+	t.Helper()
+	bin := filepath.Join(t.TempDir(), "localbridge")
+	cmd := exec.Command("go", "build", "-o", bin, "./cmd")
+	cmd.Dir = moduleRoot(t)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("build: %v\n%s", err, out)
+	}
+	return bin
+}
+
+type stdioChild struct {
+	cmd    *exec.Cmd
+	stdin  io.WriteCloser
+	lines  *bufio.Reader
+	stderr *bytes.Buffer
+}
+
+// credsFreeEnv returns the test process env minus tunnel credential
+// variables (proves the creds bypass when passed to the child).
+func credsFreeEnv(t *testing.T) []string {
+	t.Helper()
+	env := make([]string, 0, 8)
+	for _, kv := range os.Environ() {
+		k, _, _ := strings.Cut(kv, "=")
+		switch k {
+		case "OPENAI_TUNNEL_ID", "OPENAI_TUNNEL_ID_FILE", "OPENAI_API_KEY", "OPENAI_API_KEY_FILE":
+			continue
+		}
+		env = append(env, kv)
+	}
+	return env
+}
+
+// startStdioChild spawns the binary with piped stdio and a creds-free
+// environment (proves the creds bypass: tunnel secrets absent).
+func startStdioChild(t *testing.T, bin string, args ...string) *stdioChild {
+	return startStdioChildEnv(t, bin, nil, args...)
+}
+
+// startStdioChildEnv spawns the binary with piped stdio; extra vars
+// append after the creds strip (planted-creds bypass proof). With nil
+// extra the child env is asserted creds-free.
+func startStdioChildEnv(t *testing.T, bin string, extra []string, args ...string) *stdioChild {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	t.Cleanup(cancel)
+	cmd := exec.CommandContext(ctx, bin, args...)
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	env := append(credsFreeEnv(t), extra...)
+	cmd.Env = env
+	if len(extra) == 0 {
+		for _, kv := range env {
+			if k, _, _ := strings.Cut(kv, "="); strings.HasPrefix(k, "OPENAI_TUNNEL_ID") || strings.HasPrefix(k, "OPENAI_API_KEY") {
+				t.Fatalf("creds not cleared: %q", k)
+			}
+		}
+	}
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("start: %v\nstderr: %s", err, stderr.String())
+	}
+	t.Cleanup(func() { _ = cmd.Process.Kill() })
+	return &stdioChild{cmd: cmd, stdin: stdin, lines: bufio.NewReader(stdout), stderr: &stderr}
+}
+
+func (s *stdioChild) send(t *testing.T, line string) {
+	t.Helper()
+	if _, err := io.WriteString(s.stdin, line+"\n"); err != nil {
+		t.Fatalf("send: %v\nstderr: %s", err, s.stderr.String())
+	}
+}
+
+func (s *stdioChild) readLine(t *testing.T) string {
+	t.Helper()
+	line, err := s.lines.ReadString('\n')
+	if err != nil {
+		t.Fatalf("read: %v\nstderr: %s", err, s.stderr.String())
+	}
+	return strings.TrimRight(line, "\r\n")
+}
+
+// TestStdioServe drives a REAL subprocess boundary (in-memory pairs
+// prove nothing about framing): initialize -> tools/list (23 natives)
+// -> tools/call echo, all as raw newline-delimited JSON-RPC with creds
+// cleared, then asserts frame-only stdout via framesOK and clean EOF
+// exit.
+func TestStdioServe(t *testing.T) {
+	bin := buildLocalbridge(t)
+	ws := t.TempDir()
+	sd := t.TempDir()
+	c := startStdioChild(t, bin, "--test", "--path", ws, "--state-dir", sd)
+
+	c.send(t, `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2026-07-28","capabilities":{},"clientInfo":{"name":"t","version":"0"}}}`)
+	initLine := c.readLine(t)
+	if !framesOK(initLine) || !strings.Contains(initLine, `"id":1`) || !strings.Contains(initLine, `"result"`) {
+		t.Fatalf("initialize: %q", initLine)
+	}
+	c.send(t, `{"jsonrpc":"2.0","method":"notifications/initialized"}`)
+
+	c.send(t, `{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}`)
+	listLine := c.readLine(t)
+	var listed struct {
+		Result struct {
+			Tools []json.RawMessage `json:"tools"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal([]byte(listLine), &listed); err != nil {
+		t.Fatalf("list unmarshal: %v (%q)", err, listLine)
+	}
+	if len(listed.Result.Tools) != 23 {
+		t.Fatalf("tools = %d, want 23", len(listed.Result.Tools))
+	}
+
+	c.send(t, `{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"echo","arguments":{"message":"hi-stdio"}}}`)
+	callLine := c.readLine(t)
+	if !strings.Contains(callLine, `"id":3`) || !strings.Contains(callLine, "hi-stdio") {
+		t.Fatalf("echo call: %q", callLine)
+	}
+
+	// EOF -> clean exit; full stdout must be frames only.
+	if err := c.stdin.Close(); err != nil {
+		t.Fatal(err)
+	}
+	rest, _ := io.ReadAll(c.lines)
+	if err := c.cmd.Wait(); err != nil {
+		t.Fatalf("exit: %v\nstderr: %s", err, c.stderr.String())
+	}
+	var out strings.Builder
+	out.WriteString(initLine + "\n" + listLine + "\n" + callLine + "\n")
+	out.Write(rest)
+	if !framesOK(out.String()) {
+		t.Fatalf("stdout purity: %q", out.String())
+	}
+}
+
+// TestStdioBrokenStdout is Track A RED->GREEN: with stdout's reader
+// closed, the initialize response write must surface as a non-zero
+// stdio-named error — never a SIGPIPE death with empty stderr.
+func TestStdioBrokenStdout(t *testing.T) {
+	bin := buildLocalbridge(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, bin, "--test", "--path", t.TempDir(), "--state-dir", t.TempDir())
+	cmd.Env = credsFreeEnv(t)
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	// Reader gone: every stdout write is SIGPIPE/EPIPE.
+	if err := stdout.Close(); err != nil {
+		t.Fatal(err)
+	}
+	_, _ = io.WriteString(stdin, `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2026-07-28","capabilities":{},"clientInfo":{"name":"t","version":"0"}}}`+"\n")
+	err = cmd.Wait()
+	exitErr, ok := err.(*exec.ExitError)
+	if !ok || exitErr.ExitCode() == 0 || exitErr.ExitCode() == -1 {
+		t.Fatalf("want non-zero exit (never signal death), got %v", err)
+	}
+	if !strings.Contains(stderr.String(), "stdio") {
+		t.Fatalf("want stdio diagnostic, stderr %q", stderr.String())
+	}
+}
+
+// TestStdioPlantedCredsBypassed serves with planted tunnel markers
+// (direct + _FILE at invalid paths): the bypass must hold and neither
+// wire output nor stderr may carry planted values.
+func TestStdioPlantedCredsBypassed(t *testing.T) {
+	bin := buildLocalbridge(t)
+	ws := t.TempDir()
+	sd := t.TempDir()
+	bogus := filepath.Join(t.TempDir(), "nope")
+	extra := []string{
+		"OPENAI_TUNNEL_ID=planted-tid-marker",
+		"OPENAI_API_KEY=planted-key-marker",
+		"OPENAI_TUNNEL_ID_FILE=" + bogus,
+		"OPENAI_API_KEY_FILE=" + bogus,
+	}
+	c := startStdioChildEnv(t, bin, extra, "--test", "--path", ws, "--state-dir", sd)
+	c.send(t, `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2026-07-28","capabilities":{},"clientInfo":{"name":"t","version":"0"}}}`)
+	initLine := c.readLine(t)
+	if !strings.Contains(initLine, `"result"`) {
+		t.Fatalf("must still serve: %q", initLine)
+	}
+	c.send(t, `{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}`)
+	listLine := c.readLine(t)
+	if !strings.Contains(listLine, `"tools"`) {
+		t.Fatalf("must still serve: %q", listLine)
+	}
+	if err := c.stdin.Close(); err != nil {
+		t.Fatal(err)
+	}
+	rest, _ := io.ReadAll(c.lines)
+	if err := c.cmd.Wait(); err != nil {
+		t.Fatalf("exit: %v\nstderr: %s", err, c.stderr.String())
+	}
+	for _, leak := range []string{"planted-tid-marker", "planted-key-marker", bogus} {
+		if strings.Contains(initLine+listLine+string(rest), leak) {
+			t.Fatalf("wire output leaked %q", leak)
+		}
+		if strings.Contains(c.stderr.String(), leak) {
+			t.Fatalf("stderr leaked %q: %q", leak, c.stderr.String())
+		}
 	}
 }
